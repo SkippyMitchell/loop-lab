@@ -921,6 +921,7 @@ function surfPad(x, y) {
 }
 function surfStart(e) {
   unlock();
+  if (e.touches) { const live = new Set([...e.touches].map(t => t.identifier)); for (const id of [...SG.active]) if (!live.has(id)) SG.active.delete(id); }
   const now = performance.now();
   for (const t of e.changedTouches) {
     SG.active.add(t.identifier);
@@ -950,6 +951,7 @@ function surfStart(e) {
 }
 function surfEnd(e) {
   for (const t of e.changedTouches) SG.active.delete(t.identifier);
+  if (e.touches && !e.touches.length) SG.active.clear();
   if (!SG.active.size && SG.cmd) { SG.cmd = false; exitSurface(); }
 }
 function flash(k) {
@@ -1412,9 +1414,24 @@ function onTap(n, x, y) {
   } else if (n === 3) togglePlay();
 }
 const gl = $('gl');
+// iOS sometimes never reports a finger lifting (for example when a multi-finger tap
+// starts audio). Every touch event lists the fingers really on the glass, so forget
+// any finger that isn't there, or one lost lift would freeze every gesture after it.
+function forgetLost(map, e) {
+  if (!e.touches) return;
+  const live = new Set(); for (const t of e.touches) live.add(t.identifier);
+  for (const id of [...map.keys()]) if (!live.has(id)) map.delete(id);
+}
+let lastTouchEv = 0;
+setInterval(() => {                                   // last resort: nothing has moved for 4 s
+  if (G.pts.size && !G.held && performance.now() - lastTouchEv > 4000) { G.pts.clear(); clearTimeout(G.hold); }
+}, 1000);
+['gesturestart', 'gesturechange', 'gestureend'].forEach(t => document.addEventListener(t, e => e.preventDefault(), {passive: false}));
 gl.addEventListener('touchstart', e => {
   e.preventDefault(); if (!started) return; unlock();
+  lastTouchEv = performance.now();
   if (S.surface) { surfStart(e); return; }
+  forgetLost(G.pts, e);
   if (G.pts.size === 0) {
     G.all = []; G.max = 0; G.held = false; G.exploring = false; G.moved = 0; G.last = -1;
     G.t0 = performance.now(); clearTimeout(G.hold); G.hold = setTimeout(holdFire, 450);
@@ -1424,7 +1441,7 @@ gl.addEventListener('touchstart', e => {
   if (G.max > 1) clearTimeout(G.hold);
 }, {passive: false});
 gl.addEventListener('touchmove', e => {
-  e.preventDefault(); if (S.surface) return;
+  e.preventDefault(); lastTouchEv = performance.now(); if (S.surface) return;
   for (const t of e.changedTouches) {
     const p = G.pts.get(t.identifier); if (!p) continue;
     p.x = t.clientX; p.y = t.clientY;
@@ -1440,8 +1457,10 @@ gl.addEventListener('touchmove', e => {
 }, {passive: false});
 function tEnd(e) {
   e.preventDefault(); if (!started) return;
+  lastTouchEv = performance.now();
   if (S.surface) { surfEnd(e); return; }
   for (const t of e.changedTouches) G.pts.delete(t.identifier);
+  forgetLost(G.pts, e);
   if (G.pts.size) return;
   clearTimeout(G.hold);
   if (G.held) { G.held = false; holdEnd(); return; }
