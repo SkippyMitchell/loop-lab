@@ -89,8 +89,40 @@ function initAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'interactive'});
   master = ctx.createGain(); master.connect(ctx.destination);
   uiBus = ctx.createGain(); uiBus.gain.value = 0.9; uiBus.connect(ctx.destination);
+  ctx.onstatechange = () => { if (ctx.state !== 'running' && ctx.state !== 'closed') resumeSoon(); };
 }
-function unlock() { if (ctx && ctx.state !== 'running') ctx.resume(); }
+function unlock() {
+  if (!ctx) return;
+  if (ctx.state !== 'running' && ctx.state !== 'closed') { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
+}
+function resumeSoon() { unlock(); setTimeout(unlock, 300); }
+// iOS can leave an audio engine silent after the microphone or speech changes the
+// phone's audio setup. Rebuild a fresh engine; recorded sounds are kept.
+let rebuilding = false;
+async function rebuildAudio(quiet) {
+  if (rebuilding) return; rebuilding = true;
+  const wasPlaying = S.playing;
+  if (wasPlaying) stopTransport();
+  try { await ctx.close(); } catch (e) {}
+  initAudio();
+  mic = null; proc = null;
+  if (micStream && micLive()) connectMic(); else if (micStream) await ensureMic(true);
+  for (const k in liveChokes) delete liveChokes[k];
+  previewVoice = null;
+  unlock();
+  if (wasPlaying) startTransport(0);
+  rebuilding = false;
+  if (!quiet) { SND.done(); speak('Audio restarted.'); }
+}
+// Watchdog: if the engine's clock stops moving, try to resume, then rebuild.
+let wd = {last: -1, stuck: 0};
+setInterval(() => {
+  if (!started || !ctx || rebuilding || S.capturing) return;
+  const t = ctx.currentTime;
+  if (ctx.state === 'running' && t === wd.last) wd.stuck++; else { wd.stuck = 0; if (ctx.state !== 'running') unlock(); }
+  wd.last = t;
+  if (wd.stuck >= 3) { wd.stuck = 0; rebuildAudio(true); }
+}, 1000);
 
 function tone(freq, dur = 0.06, vol = 0.15, when = 0, type = 'sine', dest) {
   const t = when || ctx.currentTime;
@@ -276,17 +308,20 @@ async function ensureMic(force) {
   try {
     if (micStream) micStream.getTracks().forEach(t => t.stop());
     micStream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false}});
-    if (mic) try { mic.disconnect(); } catch (e) {}
-    mic = ctx.createMediaStreamSource(micStream);
-    if (!proc) {
-      proc = ctx.createScriptProcessor(2048, 1, 1);
-      proc.onaudioprocess = e => { if (cap.on) cap.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
-      const z = ctx.createGain(); z.gain.value = 0;
-      proc.connect(z); z.connect(ctx.destination);
-    }
-    mic.connect(proc);
+    connectMic();
     return true;
   } catch (e) { mic = null; micStream = null; return false; }
+}
+function connectMic() {
+  if (mic) try { mic.disconnect(); } catch (e) {}
+  mic = ctx.createMediaStreamSource(micStream);
+  if (!proc) {
+    proc = ctx.createScriptProcessor(2048, 1, 1);
+    proc.onaudioprocess = e => { if (cap.on) cap.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    const z = ctx.createGain(); z.gain.value = 0;
+    proc.connect(z); z.connect(ctx.destination);
+  }
+  mic.connect(proc);
 }
 async function startPadRecord() {
   if (cap.busy) return;
@@ -734,7 +769,9 @@ function seqItems() {
     {l: () => 'Undo last take', v: () => S.takes.length ? S.takes.length + (S.takes.length === 1 ? ' take' : ' takes') : 'nothing to undo', a: () => { undoTake(); return 'quiet'; }},
     {l: () => 'Clear pattern', v: () => S.events.length + (S.events.length === 1 ? ' hit' : ' hits'), a: confirmThen('clearPat', clearPattern)},
     {l: () => 'Bounce pattern to loop track', a: () => { bounce(); return 'quiet'; },
-      h: 'Turns the pattern into an audio loop track, then clears the pattern so you can record the next layer. Up to 8 tracks. Tempo locks while tracks exist.'}
+      h: 'Turns the pattern into an audio loop track, then clears the pattern so you can record the next layer. Up to 8 tracks. Tempo locks while tracks exist.'},
+    {l: () => 'Restart audio', a: () => { rebuildAudio(false); return 'quiet'; },
+      h: 'Use this if sounds stop. It restarts the sound engine and keeps all your recordings.'}
   ];
   S.tracks.forEach((tr, ti) => it.push({
     l: () => 'Loop track ' + (ti + 1), v: () => tr.bars + (tr.bars === 1 ? ' bar' : ' bars') + ', ' + (tr.muted ? 'muted' : 'on') + ', volume ' + pct(tr.vol),
@@ -897,7 +934,7 @@ function tEnd(e) {
   if (G.held) { G.held = false; holdEnd(); return; }
   if (G.all.length) classify();
 }
-gl.addEventListener('touchend', tEnd, {passive: false});
+gl.addEventListener('touchend', e => { unlock(); tEnd(e); }, {passive: false});
 gl.addEventListener('touchcancel', tEnd, {passive: false});
 
 // keyboard (for testing on a laptop)
@@ -961,9 +998,11 @@ function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': 
 $('startBtn').addEventListener('click', async () => {
   initAudio(); unlock();
   speak('Starting Loop Lab.');
-  const micP = ensureMic();
+  await ensureMic();
+  // Turning the microphone on changes the phone's audio setup, which can silence an
+  // engine made before it. Start a fresh engine now that the mic is on.
+  if (mic) await rebuildAudio(true);
   const n = await loadAll();
-  await micP;
   $('start').remove(); started = true; render();
   speak('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
     (mic ? '' : 'Microphone is not available, so use Load from Files or demo sounds in the pad menu. ') +
