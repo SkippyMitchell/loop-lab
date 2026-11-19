@@ -78,17 +78,19 @@ const S = {
   events: [], takes: [], takeId: 0, curTake: 0,
   tracks: [],                           // {buf, bars, vol, muted, src, g}
   playing: false, recording: false, capturing: false,
-  rate: 1.1, confirm: null, confirmT: 0, taps: [], editStep: 1, audioMode: 'ambient'
+  rate: 1.1, confirm: null, confirmT: 0, taps: [], editStep: 1, audioMode: 'playback',
+  voiceEngine: 'espeak', vPitch: 50, duck: true, esVoice: ''
 };
 let started = false;
 
 // ---------------- audio ----------------
-let ctx, master, uiBus;
+let ctx, master, uiBus, speechBus;
 const scheduled = [];
 function initAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'interactive'});
   master = ctx.createGain(); master.connect(ctx.destination);
   uiBus = ctx.createGain(); uiBus.gain.value = 0.9; uiBus.connect(ctx.destination);
+  speechBus = ctx.createGain(); speechBus.gain.value = 1; speechBus.connect(ctx.destination);
 }
 // Keep iOS in one steady audio mode ("playback") so speech and sounds share it
 // instead of fighting. Recording switches to "play-and-record" only while you hold.
@@ -105,6 +107,7 @@ function resumeSoon() { unlock(); setTimeout(unlock, 300); }
 let rebuilding = false, lastRebuild = 0;
 async function rebuildAudio(quiet) {
   if (rebuilding) return; rebuilding = true; lastRebuild = performance.now();
+  hushSpeech();
   const wasPlaying = S.playing;
   if (wasPlaying) stopTransport();
   try { await ctx.close(); } catch (e) {}
@@ -223,15 +226,111 @@ function pickVoice() {
            vs.find(v => v.lang && v.lang.startsWith('en')) || null;
 }
 if (synth) { pickVoice(); synth.onvoiceschanged = pickVoice; }
-function speak(text, interrupt = true) {
-  $('status').textContent = text;
-  if (!synth || S.capturing) return;
+function sysSpeak(text, interrupt) {
+  if (!synth) return;
   if (interrupt) synth.cancel();
   const u = new SpeechSynthesisUtterance(text);
   u.rate = S.rate; u.lang = 'en-US'; if (sVoice) u.voice = sVoice;
   synth.speak(u);
 }
-function hush() { if (synth) synth.cancel(); }
+
+// ---- eSpeak voice, played through Loop Lab's own sound engine ----
+// Speech and sounds share one engine, so iOS can't fade one under the other.
+const ES = {worker: null, ready: false, failed: false, id: 0, pending: new Map(), cache: new Map(),
+  jobs: [], workerBusy: false, queue: [], busy: false, cur: null, curRes: null};
+let speechGen = 0;
+function initEspeak() {
+  try { ES.worker = new Worker('espeak-worker.js'); } catch (e) { ES.failed = true; return; }
+  ES.worker.onmessage = e => {
+    const d = e.data;
+    if (d.ready) { ES.ready = true; return; }
+    const cb = ES.pending.get(d.id); if (cb) { ES.pending.delete(d.id); cb(d.wav); }
+  };
+  ES.worker.onerror = () => { ES.failed = true; ES.workerBusy = false; ES.jobs.forEach(j => j.res(null)); ES.jobs = []; };
+}
+initEspeak();
+const useEspeak = () => S.voiceEngine === 'espeak' && ES.ready && !ES.failed && ctx;
+const ES_VOICES = {'': 'default', m1: 'male 1', m2: 'male 2', m3: 'male 3', m4: 'male 4', m5: 'male 5', m6: 'male 6', m7: 'male 7',
+  f1: 'female 1', f2: 'female 2', f3: 'female 3', f4: 'female 4', f5: 'female 5', klatt: 'Klatt 1', klatt2: 'Klatt 2', klatt3: 'Klatt 3',
+  croak: 'croak', whisper: 'whisper', whisperf: 'whisper female'};
+function esArgs() { return {speed: clamp(Math.round(175 * S.rate), 80, 450), pitch: S.vPitch, amplitude: 100, wordgap: 0,
+  voice: 'en/en-us' + (ES_VOICES[S.esVoice] && S.esVoice ? '+' + S.esVoice : '')}; }
+function wavToBuffer(wav) {
+  const dv = new DataView(wav.buffer, wav.byteOffset, wav.byteLength);
+  const sr = dv.getUint32(24, true), n = Math.floor((wav.byteLength - 44) / 2);
+  if (n <= 0) return null;
+  const f = new Float32Array(n);
+  for (let i = 0; i < n; i++) f[i] = dv.getInt16(44 + i * 2, true) / 32768;
+  let s = 0; while (s < n && Math.abs(f[s]) < 0.01) s++;
+  let e = n - 1; while (e > s && Math.abs(f[e]) < 0.01) e--;
+  s = Math.max(0, s - Math.floor(0.01 * sr)); e = Math.min(n, e + Math.floor(0.05 * sr));
+  if (e <= s) return null;
+  const b = ctx.createBuffer(1, e - s, sr); b.copyToChannel(f.subarray(s, e), 0);
+  return b;
+}
+function genSpeech(text) {
+  const key = text + '|' + S.rate + '|' + S.vPitch + '|' + S.esVoice, c = ES.cache.get(key);
+  if (c) { ES.cache.delete(key); ES.cache.set(key, c); return Promise.resolve(c); }
+  return new Promise(res => { ES.jobs.push({text, key, res, gen: speechGen}); runJobs(); });
+}
+function runJobs() {
+  if (ES.workerBusy) return;
+  while (ES.jobs.length && ES.jobs[0].gen !== speechGen) ES.jobs.shift().res(null);   // drop stale requests
+  const j = ES.jobs.shift(); if (!j) return;
+  ES.workerBusy = true;
+  const id = ++ES.id;
+  ES.pending.set(id, wav => {
+    ES.workerBusy = false;
+    let b = null; try { if (wav) b = wavToBuffer(wav); } catch (e) {}
+    if (b) { ES.cache.set(j.key, b); if (ES.cache.size > 300) ES.cache.delete(ES.cache.keys().next().value); }
+    j.res(b); runJobs();
+  });
+  ES.worker.postMessage({id, text: j.text, args: esArgs()});
+}
+function duck(on) {
+  if (!ctx || !master) return;
+  const g = on && S.duck ? 0.4 : 1;
+  try { master.gain.setTargetAtTime(g, ctx.currentTime, 0.04); } catch (e) {}
+}
+async function pumpSpeech() {
+  if (ES.busy) return; ES.busy = true;
+  while (ES.queue.length) {
+    const item = ES.queue.shift();
+    const b = await item.p;
+    if (item.gen !== speechGen || !b) continue;
+    await new Promise(res => {
+      if (item.gen !== speechGen) return res();
+      const src = ctx.createBufferSource(); src.buffer = b; src.connect(speechBus);
+      let done = false;
+      const fin = () => { if (done) return; done = true; if (ES.cur === src) { ES.cur = null; ES.curRes = null; } res(); };
+      src.onended = fin;
+      setTimeout(fin, b.duration * 1000 + 700);   // never get stuck if iOS pauses the engine
+      ES.cur = src; ES.curRes = fin; duck(true); unlock(); src.start();
+    });
+  }
+  ES.busy = false; duck(false);
+}
+function hushSpeech() {
+  speechGen++; ES.queue.length = 0;
+  if (ES.cur) { try { ES.cur.onended = null; ES.cur.stop(); } catch (e) {} ES.cur = null; }
+  if (ES.curRes) { const r = ES.curRes; ES.curRes = null; r(); }
+  duck(false);
+}
+function speak(text, interrupt = true) {
+  $('status').textContent = text;
+  if (S.capturing) return;
+  if (!useEspeak()) { sysSpeak(text, interrupt); return; }
+  if (interrupt) { hushSpeech(); if (synth) synth.cancel(); }
+  const gen = speechGen;
+  const parts = (text.match(/[^.!?]+[.!?]*/g) || [text]).map(x => x.trim()).filter(Boolean);
+  for (const p of parts) ES.queue.push({p: genSpeech(p), gen});   // first sentence starts while the rest generate
+  pumpSpeech();
+}
+function hush() { hushSpeech(); if (synth) synth.cancel(); }
+function waitForVoice(ms) {
+  return new Promise(res => { const t0 = performance.now(); (function chk() {
+    if (ES.ready || ES.failed || performance.now() - t0 > ms) res(); else setTimeout(chk, 100); })(); });
+}
 
 // ---------------- storage (IndexedDB) ----------------
 const DB = {
@@ -281,7 +380,7 @@ let saveTimer = null;
 function saveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const k = ['bank','surfaceBank','bpm','bpb','bars','metro','metroVol','countIn','quant','events','takes','takeId','rate','editStep','audioMode'];
+    const k = ['bank','surfaceBank','bpm','bpb','bars','metro','metroVol','countIn','quant','events','takes','takeId','rate','editStep','audioMode','voiceEngine','vPitch','duck','esVoice'];
     const o = {}; k.forEach(x => o[x] = S[x]);
     DB.put('state', o);
   }, 300);
@@ -289,7 +388,7 @@ function saveState() {
 async function loadAll() {
   if (!await DB.open()) return 0;
   const st = await DB.get('state');
-  if (st) Object.assign(S, st);
+  if (st) { if (st.voiceEngine === undefined) st.audioMode = 'playback'; Object.assign(S, st); }
   let n = 0;
   for (let i = 0; i < 64; i++) {
     const r = await DB.get('pad' + i);
@@ -794,6 +893,15 @@ function seqItems() {
     {l: () => 'Audio mode', v: () => AUDIO_MODES[S.audioMode],
       adj: d => { const k = Object.keys(AUDIO_MODES); S.audioMode = k[clamp(k.indexOf(S.audioMode) + d, 0, k.length - 1)]; setSession(S.audioMode); },
       h: 'Changes how iOS mixes Loop Lab sounds with its speech. Try each one if speech fades or cuts out. Mix with speech is muted by the ring silent switch.'},
+    {l: () => 'Voice', v: () => S.voiceEngine === 'espeak' ? (ES.failed ? 'eSpeak, could not load' : 'eSpeak') : 'iPhone voice',
+      a: () => toggleVoice(), adj: () => toggleVoice(),
+      h: 'eSpeak plays through Loop Lab, so sounds never fade it out. The iPhone voice sounds more natural but iOS may fade it under sounds.'},
+    {l: () => 'eSpeak voice', v: () => ES_VOICES[S.esVoice] || 'default',
+      adj: d => { const k = Object.keys(ES_VOICES); S.esVoice = k[clamp(k.indexOf(S.esVoice) + d, 0, k.length - 1)]; },
+      h: 'Choose from 18 eSpeak voices. Swipe left or right to hear each one.'},
+    {l: () => 'Voice pitch', v: () => String(S.vPitch), adj: d => { S.vPitch = clamp(S.vPitch + d * 5, 0, 99); }, h: 'eSpeak pitch, from 0 to 99.'},
+    {l: () => 'Lower sounds while speaking', v: () => S.duck ? 'on' : 'off', a: () => { S.duck = !S.duck; }, adj: () => { S.duck = !S.duck; },
+      h: 'Turns the loop and pads down while eSpeak talks, so you can hear it over the music.'},
     {l: () => 'Restart audio', a: () => { rebuildAudio(false); return 'quiet'; },
       h: 'Use this if sounds stop. It restarts the sound engine and keeps all your recordings.'}
   ];
@@ -880,6 +988,13 @@ function whereAmI() {
   else if (S.tab === 'sample') { const full = S.pads.slice(S.bank * 16, S.bank * 16 + 16).filter(Boolean).length;
     speak('Sample tab, bank ' + BANKS[S.bank] + ', ' + full + ' of 16 recorded. ' + loop); }
   else speak('Sequence tab. ' + S.bpm + ' BPM, ' + S.bars + ' bars of ' + S.bpb + '. ' + loop + ' Pattern has ' + S.events.length + ' hits, ' + S.tracks.length + ' loop tracks.');
+}
+function toggleVoice() {
+  hush();
+  S.voiceEngine = S.voiceEngine === 'espeak' ? 'system' : 'espeak';
+  if (S.voiceEngine === 'espeak' && ES.failed) { S.voiceEngine = 'system'; speak('eSpeak could not load. Staying with the iPhone voice.'); return 'quiet'; }
+  setSession(S.voiceEngine === 'espeak' ? 'playback' : 'ambient');
+  S.audioMode = S.voiceEngine === 'espeak' ? 'playback' : 'ambient';
 }
 function rateChange(d) { S.rate = clamp(round1(S.rate + d * 0.1), 0.5, 2); saveState(); speak('Speech rate ' + Math.round(S.rate * 100) + ' percent'); }
 function help() {
@@ -1031,6 +1146,7 @@ $('startBtn').addEventListener('click', async () => {
   await afterMic();
   const n = await loadAll();
   setSession(S.audioMode);
+  await waitForVoice(4000);
   $('start').remove(); started = true; render();
   speak('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
     (micOK ? '' : 'Microphone is not available, so use Load from Files or demo sounds in the pad menu. ') +
