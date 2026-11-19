@@ -78,7 +78,7 @@ const S = {
   events: [], takes: [], takeId: 0, curTake: 0,
   tracks: [],                           // {buf, bars, vol, muted, src, g}
   playing: false, recording: false, capturing: false,
-  rate: 1.1, confirm: null, confirmT: 0, taps: [], editStep: 1
+  rate: 1.1, confirm: null, confirmT: 0, taps: [], editStep: 1, audioMode: 'ambient'
 };
 let started = false;
 
@@ -93,6 +93,7 @@ function initAudio() {
 // Keep iOS in one steady audio mode ("playback") so speech and sounds share it
 // instead of fighting. Recording switches to "play-and-record" only while you hold.
 function setSession(type) { try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch (e) {} }
+const AUDIO_MODES = {ambient: 'mix with speech', playback: 'playback', auto: 'automatic'};
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function unlock() {
   if (!ctx) return;
@@ -280,7 +281,7 @@ let saveTimer = null;
 function saveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const k = ['bank','surfaceBank','bpm','bpb','bars','metro','metroVol','countIn','quant','events','takes','takeId','rate','editStep'];
+    const k = ['bank','surfaceBank','bpm','bpb','bars','metro','metroVol','countIn','quant','events','takes','takeId','rate','editStep','audioMode'];
     const o = {}; k.forEach(x => o[x] = S[x]);
     DB.put('state', o);
   }, 300);
@@ -323,7 +324,7 @@ function closeMic() {
 }
 // After the mic closes, only rebuild the sound engine if it actually broke.
 async function afterMic() {
-  setSession('playback');
+  setSession(S.audioMode);
   unlock();
   const t0 = ctx.currentTime;
   await sleep(350);
@@ -790,6 +791,9 @@ function seqItems() {
     {l: () => 'Clear pattern', v: () => S.events.length + (S.events.length === 1 ? ' hit' : ' hits'), a: confirmThen('clearPat', clearPattern)},
     {l: () => 'Bounce pattern to loop track', a: () => { bounce(); return 'quiet'; },
       h: 'Turns the pattern into an audio loop track, then clears the pattern so you can record the next layer. Up to 8 tracks. Tempo locks while tracks exist.'},
+    {l: () => 'Audio mode', v: () => AUDIO_MODES[S.audioMode],
+      adj: d => { const k = Object.keys(AUDIO_MODES); S.audioMode = k[clamp(k.indexOf(S.audioMode) + d, 0, k.length - 1)]; setSession(S.audioMode); },
+      h: 'Changes how iOS mixes Loop Lab sounds with its speech. Try each one if speech fades or cuts out. Mix with speech is muted by the ring silent switch.'},
     {l: () => 'Restart audio', a: () => { rebuildAudio(false); return 'quiet'; },
       h: 'Use this if sounds stop. It restarts the sound engine and keeps all your recordings.'}
   ];
@@ -1016,7 +1020,7 @@ function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': 
 
 // ---------------- start ----------------
 $('startBtn').addEventListener('click', async () => {
-  setSession('playback');
+  setSession(S.audioMode);
   initAudio(); unlock();
   speak('Starting Loop Lab.');
   // Ask for the microphone once so the permission prompt happens now, then close it
@@ -1026,6 +1030,7 @@ $('startBtn').addEventListener('click', async () => {
   closeMic();
   await afterMic();
   const n = await loadAll();
+  setSession(S.audioMode);
   $('start').remove(); started = true; render();
   speak('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
     (micOK ? '' : 'Microphone is not available, so use Load from Files or demo sounds in the pad menu. ') +
