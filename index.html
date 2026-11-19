@@ -1181,7 +1181,7 @@ function stageTap(slot) {
   S.focus = slot; zoneTone(slot);
   const z = zoneOf(slot), n = slot % 8;
   if (z === 0) {
-    if (!kitCount(n)) { render(); speak('Kit ' + (n + 1) + ', empty. Touch and hold to record a sound into it. Two-finger tap for its menu.'); return; }
+    if (!kitCount(n)) { render(); speak('Kit ' + (n + 1) + ', empty. Touch and hold to record a sound into it. Double tap for its menu.'); return; }
     S.activeKit = n; saveState(); render();
     const first = S.pads.slice(n * 8, n * 8 + 8).findIndex(Boolean);
     if (first >= 0) playPad(n * 8 + first);
@@ -1199,7 +1199,7 @@ function stageHold(slot) {
   const z = zoneOf(slot), n = slot % 8;
   if (z === 0) {
     const free = S.pads.slice(n * 8, n * 8 + 8).findIndex(x => !x);
-    if (free < 0) { speak('Kit ' + (n + 1) + ' is full. Two-finger tap, then open the kit editor to re-record a pad.'); return; }
+    if (free < 0) { speak('Kit ' + (n + 1) + ' is full. Double tap, then open the kit editor to re-record a pad.'); return; }
     startPadRecord(n * 8 + free);
   } else if (z === 1) startPatternRecord(n);
   else if (!S.tracks[n]) startMicLoop({mode: 'new', ti: n});
@@ -1322,16 +1322,16 @@ function toggleVoice() {
 function rateChange(d) { S.rate = clamp(round1(S.rate + d * 0.1), 0.5, 2); saveState(); speak('Speech rate ' + Math.round(S.rate * 100) + ' percent'); }
 function help() {
   let t;
-  if (S.menu || S.tab === 'settings') t = (S.menu ? 'Menu' : 'Settings') + '. Swipe up or down to move. Swipe left or right to change a value. Tap to choose. Touch and hold to hear a description.' + (S.menu ? ' Two-finger swipe down closes the menu.' : '');
-  else if (S.kitEd != null) t = 'Kit editor. Two rows of four pads. Tap a pad to play it, or swipe to move. Touch and hold a pad to record into it: wait for the beep, make your sound, then lift. Two-finger tap opens the pad menu, with edit, load from Files, copy, paste and clear. Two-finger swipe left for the next kit, right for the previous kit. Two-finger swipe down goes back to the stage.';
-  else t = 'Stage. Six rows of four. Top two rows: 8 kits. Middle two rows: 8 patterns. Bottom two rows: 8 loops. Tap a slot to use it: a kit becomes active, a pattern or loop turns on or off at the next bar. Touch and drag to explore and hear each slot. Swipe to move between slots. Touch and hold to record: into a kit\'s next empty pad, a pattern using the active kit, or a mic loop. Two-finger tap opens a slot\'s menu.';
-  t += ' While recording a mic loop: tap anywhere to stop at the next bar line, two-finger swipe down cancels.';
+  if (S.menu || S.tab === 'settings') t = (S.menu ? 'Menu' : 'Settings') + '. Swipe up or down to move. Swipe left or right to change a value. Two-finger tap to choose. Touch and hold to hear a description.' + (S.menu ? ' Two-finger swipe down closes the menu.' : '');
+  else if (S.kitEd != null) t = 'Kit editor. Two rows of four pads. Tap a pad, drag, or swipe to move to it. Two-finger tap plays the focused pad. Touch and hold to record into the focused pad: wait for the beep, make your sound, then lift. Double tap opens the pad menu, with edit, load from Files, copy, paste and clear. Two-finger swipe left for the next kit, right for the previous kit. Two-finger swipe down goes back to the stage.';
+  else t = 'Stage. Six rows of four. Top two rows: 8 kits. Middle two rows: 8 patterns. Bottom two rows: 8 loops. Tap a slot, drag across slots, or swipe, to move focus and hear what is there. Two-finger tap uses the focused slot: a kit becomes active, a pattern or loop turns on or off at the next bar. Touch and hold to record into the focused slot: a kit\'s next empty pad, a pattern using the active kit, or a mic loop. Double tap opens the focused slot\'s menu.';
+  t += ' While recording a mic loop: tap anywhere with one or two fingers to stop at the next bar line, two-finger swipe down cancels.';
   t += ' Everywhere: three-finger tap plays or stops. Three-finger swipe left moves on to Settings, and three-finger swipe right moves back to the Stage, like sliding pages. Three-finger swipe up or down changes speech rate. Two-finger swipe up says where you are. Two-finger double tap stops speech. Four-finger double tap opens Settings, and again returns. Four-finger tap is help.';
   speak(t);
 }
 
 // ---------------- gestures ----------------
-const G = {pts: new Map(), all: [], max: 0, t0: 0, hold: null, held: false, lastTap2: 0, tap2Timer: null, lastTap4: 0, tap4Timer: null,
+const G = {pts: new Map(), all: [], max: 0, t0: 0, hold: null, held: false, lastTap2: 0, tap2Timer: null, lastTap4: 0, tap4Timer: null, lastTap1: 0, tap1x: 0, tap1y: 0,
   exploring: false, moved: 0, last: -1};
 const posMode = () => !inList() && !S.micLoop;          // stage or kit editor: touch position matters
 function slotUnder(x, y) { return S.kitEd != null ? kitPadAt(x, y) : slotAt(x, y); }
@@ -1339,9 +1339,8 @@ function holdFire() {
   G.held = true;
   if (S.micLoop) return;
   if (inList()) { const L = curList(); const it = L && L.items[L.get()]; if (it) speak(it.h || itemText(it)); return; }
-  const p = G.all[0]; if (!p) return;
-  if (S.kitEd != null) { const j = kitPadAt(p.x0, p.y0); S.kitFocus = j; render(); startPadRecord(S.kitEd * 8 + j); }
-  else stageHold(slotAt(p.x0, p.y0));
+  if (S.kitEd != null) startPadRecord(S.kitEd * 8 + S.kitFocus);   // records into the focused pad or slot
+  else stageHold(S.focus);
 }
 function holdEnd() { if (S.capturing) stopPadRecord(); }
 function explore(x, y) {
@@ -1361,10 +1360,10 @@ function classify() {
     const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
     onSwipe(n, dir);
   } else if (d < 30 && dur < 400) {
-    if (n === 2) {
+    if (n === 2) {                                       // two-finger tap: use the focused item
       const now = performance.now();
       if (now - G.lastTap2 < 350) { clearTimeout(G.tap2Timer); G.lastTap2 = 0; hush(); }
-      else { G.lastTap2 = now; G.tap2Timer = setTimeout(() => openMenu(cx, cy), 300); }
+      else { G.lastTap2 = now; G.tap2Timer = setTimeout(() => { if (S.micLoop) requestMicStop(); else activate(); }, 300); }
     } else if (n >= 4 && !S.micLoop) {
       const now = performance.now();
       if (now - G.lastTap4 < 400) { clearTimeout(G.tap4Timer); G.lastTap4 = 0; toggleSettings(); }
@@ -1372,14 +1371,24 @@ function classify() {
     } else onTap(n, G.all[0].x0, G.all[0].y0);
   }
 }
-function openMenu(x, y) {
+// Focus first, act second: a one-finger tap only moves focus and speaks.
+function focusAt(x, y) {
+  if (inList() || x == null) { SND.tick(); speak(focusDesc()); return; }
+  if (S.kitEd != null) { S.kitFocus = kitPadAt(x, y); SND.tick(); render(); speak(padDesc(S.kitEd * 8 + S.kitFocus)); return; }
+  S.focus = slotAt(x, y); zoneTone(S.focus); render(); speak(slotDesc(S.focus));
+}
+// Two-finger tap: use whatever is focused.
+function activate() {
+  if (inList()) listActivate();
+  else if (S.kitEd != null) kitTap(S.kitFocus);
+  else stageTap(S.focus);
+}
+// One-finger double tap: open the focused item's menu.
+function openMenu() {
   if (S.micLoop) return;
-  if (inList()) { if (S.menu) listActivate(); return; }
-  if (S.kitEd != null) {
-    const j = x == null ? S.kitFocus : kitPadAt(x, y); S.kitFocus = j;
-    openMenuObj(padMenu(S.kitEd * 8 + j)); return;
-  }
-  stageMenu(x == null ? S.focus : slotAt(x, y));
+  if (inList()) { SND.edge(); speak('No menu here. Two-finger tap to choose.'); return; }
+  if (S.kitEd != null) { openMenuObj(padMenu(S.kitEd * 8 + S.kitFocus)); return; }
+  stageMenu(S.focus);
 }
 function onSwipe(n, dir) {
   if (S.micLoop) { if (n === 2 && dir === 'down') cancelMicLoop(true); return; }
@@ -1397,9 +1406,9 @@ function onSwipe(n, dir) {
 function onTap(n, x, y) {
   if (S.micLoop) { if (n === 1) requestMicStop(); else if (n === 3) { cancelMicLoop(false); stopTransport(); render(); speak('Mic loop cancelled. Stopped.'); } return; }
   if (n === 1) {
-    if (inList()) listActivate();
-    else if (S.kitEd != null) kitTap(x == null ? S.kitFocus : kitPadAt(x, y));
-    else stageTap(x == null ? S.focus : slotAt(x, y));
+    const now = performance.now();
+    if (now - G.lastTap1 < 350 && Math.hypot(x - G.tap1x, y - G.tap1y) < 70) { G.lastTap1 = 0; openMenu(); }
+    else { G.lastTap1 = now; G.tap1x = x; G.tap1y = y; focusAt(x, y); }
   } else if (n === 3) togglePlay();
 }
 const gl = $('gl');
@@ -1458,7 +1467,7 @@ document.addEventListener('keydown', e => {
   }
   const arrows = {ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right'};
   if (arrows[e.key]) { e.shiftKey ? onSwipe(3, arrows[e.key]) : onSwipe(1, arrows[e.key]); }
-  else if (e.key === 'Enter') onTap(1);
+  else if (e.key === 'Enter') activate();
   else if (e.key === ' ') {
     if (!spaceDown) { spaceDown = true; G.held = true;
       if (S.micLoop) {} else if (inList()) holdFire();
