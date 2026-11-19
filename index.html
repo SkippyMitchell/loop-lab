@@ -89,8 +89,11 @@ function initAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'interactive'});
   master = ctx.createGain(); master.connect(ctx.destination);
   uiBus = ctx.createGain(); uiBus.gain.value = 0.9; uiBus.connect(ctx.destination);
-  ctx.onstatechange = () => { if (ctx.state !== 'running' && ctx.state !== 'closed') resumeSoon(); };
 }
+// Keep iOS in one steady audio mode ("playback") so speech and sounds share it
+// instead of fighting. Recording switches to "play-and-record" only while you hold.
+function setSession(type) { try { if (navigator.audioSession && navigator.audioSession.type !== type) navigator.audioSession.type = type; } catch (e) {} }
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 function unlock() {
   if (!ctx) return;
   if (ctx.state !== 'running' && ctx.state !== 'closed') { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); }
@@ -118,7 +121,7 @@ let wd = {last: -1, stuck: 0};
 setInterval(() => {
   if (!started || !ctx || rebuilding || S.capturing) return;
   const t = ctx.currentTime;
-  if (ctx.state === 'running' && t === wd.last) wd.stuck++; else { wd.stuck = 0; if (ctx.state !== 'running') unlock(); }
+  if (ctx.state === 'running' && t === wd.last) wd.stuck++; else wd.stuck = 0;
   wd.last = t;
   if (wd.stuck >= 3 && performance.now() - lastRebuild > 20000) { wd.stuck = 0; rebuildAudio(true); }
 }, 1000);
@@ -318,7 +321,15 @@ function closeMic() {
   if (micStream) micStream.getTracks().forEach(t => t.stop());
   mic = null; micStream = null;
 }
-async function afterMic() { if (!S.playing) await rebuildAudio(true); else resumeSoon(); }
+// After the mic closes, only rebuild the sound engine if it actually broke.
+async function afterMic() {
+  setSession('playback');
+  unlock();
+  const t0 = ctx.currentTime;
+  await sleep(350);
+  if (ctx.state !== 'running' || ctx.currentTime === t0) { unlock(); await sleep(250); }
+  if (ctx.state !== 'running' || ctx.currentTime === t0) await rebuildAudio(true);
+}
 function connectMic() {
   if (mic) try { mic.disconnect(); } catch (e) {}
   mic = ctx.createMediaStreamSource(micStream);
@@ -335,6 +346,7 @@ async function startPadRecord() {
   const i = S.bank * 16 + S.focus;
   hush();
   cap.busy = true;
+  setSession('play-and-record');
   const ok = await ensureMic(true);
   cap.busy = false;
   if (!ok) { await afterMic(); speak('Microphone is not available. Check that Safari is allowed to use the microphone, or load a sound from Files in the pad menu.'); return; }
@@ -1004,13 +1016,15 @@ function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': 
 
 // ---------------- start ----------------
 $('startBtn').addEventListener('click', async () => {
+  setSession('playback');
   initAudio(); unlock();
   speak('Starting Loop Lab.');
   // Ask for the microphone once so the permission prompt happens now, then close it
   // and start a fresh sound engine in normal playback mode.
+  setSession('play-and-record');
   const micOK = await ensureMic();
   closeMic();
-  await rebuildAudio(true);
+  await afterMic();
   const n = await loadAll();
   $('start').remove(); started = true; render();
   speak('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
