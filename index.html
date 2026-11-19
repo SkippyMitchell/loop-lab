@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Loop Lab</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:#0d0f14;color:#e9edf5;font:16px -apple-system,system-ui,sans-serif;overflow:hidden;
+    -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;touch-action:none}
+  #app{position:fixed;inset:0;display:flex;flex-direction:column;padding:env(safe-area-inset-top) 10px env(safe-area-inset-bottom)}
+  header{padding:10px 4px 6px}
+  #tabs{display:flex;gap:8px}
+  #tabs span{flex:1;text-align:center;padding:8px;border-radius:10px;background:#1b2030;font-weight:600;color:#8a93a8}
+  #tabs span.on{background:#2f6fed;color:#fff}
+  #info{margin-top:8px;font-size:14px;color:#aab3c5;display:flex;justify-content:space-between}
+  #info .rec{color:#ff5a5a;font-weight:700}
+  main{flex:1;min-height:0;display:flex;flex-direction:column}
+  .grid{flex:1;display:grid;grid-template-columns:repeat(4,1fr);grid-template-rows:repeat(4,1fr);gap:8px;padding:6px 0}
+  .pad{border-radius:12px;background:#1b2030;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    font-size:13px;color:#7d869a;border:3px solid transparent;text-align:center;padding:4px;overflow:hidden}
+  .pad b{font-size:17px;color:#cfd6e4}
+  .pad.full{background:#1f4d4a;color:#bfe9e2}
+  .pad.focus{border-color:#ffd23f}
+  .pad.flash{background:#ffd23f !important;color:#000}
+  .pad.recording{background:#b3261e !important}
+  .list{flex:1;overflow:hidden;padding:6px 0}
+  .item{padding:12px;border-radius:10px;margin-bottom:6px;background:#161a25;display:flex;justify-content:space-between;border:3px solid transparent}
+  .item.focus{border-color:#ffd23f;background:#222a3d}
+  .item span:last-child{color:#9fb4ff}
+  h2{font-size:15px;color:#aab3c5;margin:6px 2px}
+  #status{min-height:40px;font-size:13px;color:#8a93a8;padding:6px 4px}
+  #gl{position:fixed;inset:0;z-index:5}
+  #start{position:fixed;inset:0;z-index:10;background:#0d0f14;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px;text-align:center;gap:20px}
+  #start button{font-size:26px;padding:22px 50px;border-radius:16px;border:0;background:#2f6fed;color:#fff;font-weight:700}
+  #start p{color:#aab3c5;max-width:420px;line-height:1.4}
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>Loop Lab</h1>
+  <p>If VoiceOver is on, double tap Start, allow microphone access, then turn VoiceOver off with your accessibility shortcut. Loop Lab speaks for itself.</p>
+  <button id="startBtn">Start</button>
+</div>
+<div id="app" aria-hidden="true">
+  <header>
+    <div id="tabs"><span id="tSample">Sample</span><span id="tSeq">Sequence</span></div>
+    <div id="info"></div>
+  </header>
+  <main id="main"></main>
+  <div id="status"></div>
+</div>
+<div id="gl" aria-hidden="true"></div>
+<input type="file" id="fileIn" accept="audio/*" style="display:none">
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const BANKS = 'ABCD';
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const round1 = v => Math.round(v * 10) / 10;
+const pct = v => Math.round(v * 100) + ' percent';
+const padName = i => BANKS[Math.floor(i / 16)] + ((i % 16) + 1);
+const QUANTS = [
+  {n: 'off', v: 0}, {n: 'quarter notes', v: 1}, {n: 'eighth notes', v: 0.5},
+  {n: 'sixteenth notes', v: 0.25}, {n: 'thirty-second notes', v: 0.125}
+];
+
+// ---------------- state ----------------
+const S = {
+  tab: 'sample', bank: 0, focus: 0,
+  pads: Array(64).fill(null),          // {buf, vol, name}
+  clip: null, padUndo: null,
+  menu: null,                           // {title, items, idx}
+  seqIdx: 0, surface: false, surfaceBank: 0,
+  bpm: 100, bpb: 4, bars: 2, metro: true, metroVol: 0.6, countIn: 1, quant: 3,
+  events: [], takes: [], takeId: 0, curTake: 0,
+  tracks: [],                           // {buf, bars, vol, muted, src, g}
+  playing: false, recording: false, capturing: false,
+  rate: 1.1, confirm: null, confirmT: 0, taps: [], editStep: 1
+};
+let started = false;
+
+// ---------------- audio ----------------
+let ctx, master, uiBus;
+const scheduled = [];
+function initAudio() {
+  ctx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'interactive'});
+  master = ctx.createGain(); master.connect(ctx.destination);
+  uiBus = ctx.createGain(); uiBus.gain.value = 0.9; uiBus.connect(ctx.destination);
+  try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
+}
+function unlock() { if (ctx && ctx.state !== 'running') ctx.resume(); }
+
+function tone(freq, dur = 0.06, vol = 0.15, when = 0, type = 'sine', dest) {
+  const t = when || ctx.currentTime;
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(vol, t + 0.003);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); g.connect(dest || uiBus);
+  o.start(t); o.stop(t + dur + 0.03);
+  return {src: o, g};
+}
+function silence(v) {
+  if (!v) return;
+  try { const now = v.g.context.currentTime; v.g.gain.cancelScheduledValues(0); v.g.gain.setValueAtTime(0, now); } catch (e) {}
+}
+const SND = {
+  tick: () => tone(1500, 0.025, 0.06),
+  edge: () => tone(170, 0.1, 0.16, 0, 'square'),
+  act: () => tone(880, 0.06, 0.13),
+  open: () => { tone(600, 0.05, 0.12); tone(900, 0.06, 0.12, ctx.currentTime + 0.05); },
+  close: () => { tone(900, 0.05, 0.12); tone(600, 0.06, 0.12, ctx.currentTime + 0.05); },
+  rec: () => tone(1000, 0.09, 0.22),
+  done: () => { tone(700, 0.05, 0.14); tone(1050, 0.08, 0.14, ctx.currentTime + 0.06); },
+  empty: () => tone(110, 0.08, 0.1, 0, 'triangle'),
+  bank: () => { tone(500, 0.04, 0.1); tone(500, 0.04, 0.1, ctx.currentTime + 0.07); }
+};
+
+// ---- pad playback with non-destructive edits ----
+const EDIT_DEFAULTS = {start: 0, end: null, pitch: 0, fine: 0, rev: false, fadeIn: 0, fadeOut: 0, pan: 0, mono: false, vol: 1};
+const PAD_KEYS = Object.keys(EDIT_DEFAULTS).concat('name');
+function newPad(buf, name) { return Object.assign({buf, name: name || ''}, EDIT_DEFAULTS); }
+const padEnd = p => p.end == null ? p.buf.duration : Math.min(p.end, p.buf.duration);
+const padRate = p => Math.pow(2, ((p.pitch || 0) + (p.fine || 0) / 100) / 12);
+const padLen = p => (padEnd(p) - (p.start || 0)) / padRate(p);
+const isEdited = p => ['start', 'pitch', 'fine', 'fadeIn', 'fadeOut', 'pan'].some(k => p[k]) || p.rev || p.mono || p.end != null;
+function revBuf(p) {
+  if (!p._rev || p._revOf !== p.buf) {
+    const b = p.buf, r = ctx.createBuffer(b.numberOfChannels, b.length, b.sampleRate);
+    for (let c = 0; c < b.numberOfChannels; c++) {
+      const s = b.getChannelData(c), d = r.getChannelData(c), n = s.length;
+      for (let k = 0; k < n; k++) d[k] = s[n - 1 - k];
+    }
+    p._rev = r; p._revOf = b;
+  }
+  return p._rev;
+}
+// opt.head: preview just the beginning; opt.tail: preview just the ending
+function makeVoice(ac, dest, i, t, chokes, opt = {}) {
+  const p = S.pads[i]; if (!p) return null;
+  const dur = p.buf.duration, st = clamp(p.start || 0, 0, dur), en = clamp(padEnd(p), st + 0.005, dur);
+  let a = p.rev ? dur - en : st, b = p.rev ? dur - st : en;
+  if (opt.head) b = Math.min(b, a + 0.4);
+  if (opt.tail) a = Math.max(a, b - 0.6);
+  const rate = padRate(p), real = (b - a) / rate;
+  const src = ac.createBufferSource(), g = ac.createGain();
+  src.buffer = p.rev ? revBuf(p) : p.buf;
+  src.playbackRate.value = rate;
+  const v = p.vol ?? 1;
+  const fi = opt.tail ? 0.002 : clamp(p.fadeIn || 0, 0.002, real / 2);
+  const fo = opt.head ? 0.01 : clamp(p.fadeOut || 0, 0.004, real / 2);
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(v, t + fi);
+  g.gain.setValueAtTime(v, t + real - fo);
+  g.gain.linearRampToValueAtTime(0, t + real);
+  src.connect(g);
+  if (p.pan && ac.createStereoPanner) { const pn = ac.createStereoPanner(); pn.pan.value = p.pan; g.connect(pn); pn.connect(dest); }
+  else g.connect(dest);
+  src.start(t, a); src.stop(t + real + 0.02);
+  const voice = {src, g, t};
+  if (p.mono && chokes) {
+    const prev = chokes[i];
+    if (prev && prev.t <= t) { try { prev.g.gain.cancelScheduledValues(t); prev.g.gain.setTargetAtTime(0, t, 0.004); } catch (e) {} }
+    chokes[i] = voice;
+  }
+  return voice;
+}
+const liveChokes = {};
+function playPad(i, when = 0, opt) {
+  const v = makeVoice(ctx, master, i, when || ctx.currentTime, liveChokes, opt);
+  if (v) scheduled.push(v);
+  return v;
+}
+let previewVoice = null;
+function preview(i, opt) { silence(previewVoice); previewVoice = playPad(i, 0, opt); }
+
+// ---------------- speech ----------------
+const synth = window.speechSynthesis;
+let sVoice = null;
+function pickVoice() {
+  if (!synth) return;
+  const vs = synth.getVoices();
+  sVoice = vs.find(v => v.lang === 'en-US' && /Samantha/.test(v.name)) ||
+           vs.find(v => v.lang === 'en-US' && v.localService) ||
+           vs.find(v => v.lang && v.lang.startsWith('en')) || null;
+}
+if (synth) { pickVoice(); synth.onvoiceschanged = pickVoice; }
+function speak(text, interrupt = true) {
+  $('status').textContent = text;
+  if (!synth || S.capturing) return;
+  if (interrupt) synth.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.rate = S.rate; u.lang = 'en-US'; if (sVoice) u.voice = sVoice;
+  synth.speak(u);
+}
+function hush() { if (synth) synth.cancel(); }
+
+// ---------------- storage (IndexedDB) ----------------
+const DB = {
+  db: null,
+  open() {
+    return new Promise(res => {
+      try {
+        const r = indexedDB.open('looplab', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('kv');
+        r.onsuccess = () => { this.db = r.result; res(true); };
+        r.onerror = () => res(false);
+      } catch (e) { res(false); }
+    });
+  },
+  put(k, v) { if (!this.db) return; try { this.db.transaction('kv', 'readwrite').objectStore('kv').put(v, k); } catch (e) {} },
+  del(k) { if (!this.db) return; try { this.db.transaction('kv', 'readwrite').objectStore('kv').delete(k); } catch (e) {} },
+  get(k) {
+    return new Promise(res => {
+      if (!this.db) return res(undefined);
+      try {
+        const r = this.db.transaction('kv').objectStore('kv').get(k);
+        r.onsuccess = () => res(r.result); r.onerror = () => res(undefined);
+      } catch (e) { res(undefined); }
+    });
+  }
+};
+function bufToRec(buf) {
+  const chs = []; for (let c = 0; c < buf.numberOfChannels; c++) chs.push(buf.getChannelData(c).slice());
+  return {chs, sr: buf.sampleRate};
+}
+function recToBuf(r) {
+  const chs = r.chs || [r.data];
+  const b = ctx.createBuffer(chs.length, chs[0].length, r.sr);
+  chs.forEach((d, c) => b.copyToChannel(d, c));
+  return b;
+}
+function savePad(i) {
+  const p = S.pads[i];
+  if (!p) { DB.del('pad' + i); return; }
+  const rec = bufToRec(p.buf); PAD_KEYS.forEach(k => rec[k] = p[k]);
+  DB.put('pad' + i, rec);
+}
+function saveTracks() {
+  DB.put('tracks', S.tracks.map(t => Object.assign(bufToRec(t.buf), {bars: t.bars, vol: t.vol, muted: t.muted})));
+}
+let saveTimer = null;
+function saveState() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    const k = ['bank','surfaceBank','bpm','bpb','bars','metro','metroVol','countIn','quant','events','takes','takeId','rate','editStep'];
+    const o = {}; k.forEach(x => o[x] = S[x]);
+    DB.put('state', o);
+  }, 300);
+}
+async function loadAll() {
+  if (!await DB.open()) return 0;
+  const st = await DB.get('state');
+  if (st) Object.assign(S, st);
+  let n = 0;
+  for (let i = 0; i < 64; i++) {
+    const r = await DB.get('pad' + i);
+    if (r) { const p = newPad(recToBuf(r), r.name); PAD_KEYS.forEach(k => { if (r[k] !== undefined) p[k] = r[k]; }); S.pads[i] = p; n++; }
+  }
+  const tr = await DB.get('tracks');
+  if (tr) S.tracks = tr.map(r => ({buf: recToBuf(r), bars: r.bars, vol: r.vol, muted: r.muted}));
+  return n;
+}
+
+// ---------------- microphone + pad recording ----------------
+let mic = null;
+const cap = {on: false, chunks: [], timer: null, pad: -1};
+async function ensureMic() {
+  if (mic) return true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false}});
+    mic = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(2048, 1, 1);
+    proc.onaudioprocess = e => { if (cap.on) cap.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    const z = ctx.createGain(); z.gain.value = 0;
+    mic.connect(proc); proc.connect(z); z.connect(ctx.destination);
+    return true;
+  } catch (e) { mic = null; return false; }
+}
+function startPadRecord() {
+  const i = S.bank * 16 + S.focus;
+  if (!mic) {
+    speak('Microphone is not available. You can load a sound from Files in the pad menu instead.');
+    ensureMic();
+    return;
+  }
+  hush();
+  S.capturing = true; cap.pad = i; cap.chunks = [];
+  SND.rec();
+  setTimeout(() => { if (S.capturing) { cap.chunks = []; cap.on = true; } }, 150);
+  cap.timer = setTimeout(() => { if (S.capturing) { G.held = false; stopPadRecord(); } }, 20000);
+  render();
+}
+function stopPadRecord() {
+  if (!S.capturing) return;
+  clearTimeout(cap.timer);
+  cap.on = false; S.capturing = false;
+  const i = cap.pad, sr = ctx.sampleRate;
+  let len = cap.chunks.reduce((a, c) => a + c.length, 0);
+  const raw = new Float32Array(len); let o = 0;
+  for (const c of cap.chunks) { raw.set(c, o); o += c.length; }
+  len = Math.max(0, len - Math.floor(0.05 * sr));           // drop finger-lift noise
+  let peak = 0; for (let k = 0; k < len; k++) peak = Math.max(peak, Math.abs(raw[k]));
+  if (len < 0.1 * sr || peak < 0.02) {
+    SND.empty(); render();
+    speak(padName(i) + ' unchanged. No sound was heard.');
+    return;
+  }
+  let s = 0; while (s < len && Math.abs(raw[s]) < 0.02) s++;
+  s = Math.max(0, s - Math.floor(0.005 * sr));
+  let e = len - 1; while (e > s && Math.abs(raw[e]) < 0.006) e--;
+  e = Math.min(len, e + Math.floor(0.03 * sr));
+  const n = e - s, gain = Math.min(0.9 / peak, 8);
+  const buf = ctx.createBuffer(1, n, sr), d = buf.getChannelData(0);
+  const fi = Math.floor(0.003 * sr), fo = Math.floor(0.01 * sr);
+  for (let k = 0; k < n; k++) {
+    let v = raw[s + k] * gain;
+    if (k < fi) v *= k / fi;
+    if (k > n - fo) v *= (n - k) / fo;
+    d[k] = v;
+  }
+  S.padUndo = {i, prev: S.pads[i]};
+  S.pads[i] = newPad(buf);
+  savePad(i); SND.done(); render();
+  speak(padName(i) + ' recorded, ' + buf.duration.toFixed(1) + ' seconds.');
+}
+
+// ---------------- demo kit ----------------
+const DEMO = [['Kick','kick'],['Snare','snare'],['Closed hat','hat'],['Open hat','ohat'],['Clap','clap'],['Rim','rim'],
+  ['Low tom','tomL'],['High tom','tomH'],['Cowbell','cow'],['Shaker','shaker'],['Bass C','b65.41'],['Bass E flat','b77.78'],
+  ['Bass F','b87.31'],['Bass G','b98'],['Chord stab','stab'],['Blip','blip']];
+function gen(kind, sr) {
+  const N = s => Math.floor(s * sr), nz = () => Math.random() * 2 - 1;
+  let len = N(0.5), d, ph = 0, prev = 0;
+  const mk = l => { len = N(l); d = new Float32Array(len); };
+  if (kind[0] === 'b' && kind !== 'blip') {
+    const f = parseFloat(kind.slice(1)); mk(0.6);
+    for (let i = 0; i < len; i++) { const t = i / sr; ph += 2 * Math.PI * f / sr;
+      d[i] = (Math.sin(ph) + 0.35 * Math.sin(2 * ph) + 0.15 * Math.sin(3 * ph)) * Math.exp(-t * 4) * Math.min(1, t / 0.005); }
+  } else switch (kind) {
+    case 'kick': mk(0.5); for (let i = 0; i < len; i++) { const t = i / sr; ph += 2 * Math.PI * (45 + 110 * Math.exp(-t * 25)) / sr; d[i] = Math.sin(ph) * Math.exp(-t * 7); } break;
+    case 'snare': mk(0.3); for (let i = 0; i < len; i++) { const t = i / sr; d[i] = nz() * 0.7 * Math.exp(-t * 18) + Math.sin(2 * Math.PI * 190 * t) * 0.5 * Math.exp(-t * 30); } break;
+    case 'hat': case 'ohat': case 'shaker': mk(kind === 'hat' ? 0.08 : kind === 'ohat' ? 0.45 : 0.15);
+      for (let i = 0; i < len; i++) { const t = i / sr, n = nz(), h = n - prev; prev = n;
+        const env = kind === 'hat' ? Math.exp(-t * 60) : kind === 'ohat' ? Math.exp(-t * 8) : (t < 0.02 ? t / 0.02 : Math.exp(-(t - 0.02) * 35));
+        d[i] = h * 0.5 * env; } break;
+    case 'clap': mk(0.3); for (let i = 0; i < len; i++) { const t = i / sr;
+      const env = t < 0.03 ? Math.exp(-(t % 0.01) * 300) : Math.exp(-(t - 0.03) * 20); const n = nz(), h = n - prev; prev = n; d[i] = h * env; } break;
+    case 'rim': mk(0.07); for (let i = 0; i < len; i++) { const t = i / sr; d[i] = Math.sin(2 * Math.PI * 1700 * t) * Math.exp(-t * 80) + nz() * 0.3 * Math.exp(-t * 120); } break;
+    case 'tomL': case 'tomH': { const f0 = kind === 'tomL' ? 110 : 190; mk(0.4);
+      for (let i = 0; i < len; i++) { const t = i / sr; ph += 2 * Math.PI * (f0 * (0.75 + 0.25 * Math.exp(-t * 20))) / sr; d[i] = Math.sin(ph) * Math.exp(-t * 9); } break; }
+    case 'cow': mk(0.35); for (let i = 0; i < len; i++) { const t = i / sr;
+      d[i] = (Math.sign(Math.sin(2 * Math.PI * 540 * t)) + Math.sign(Math.sin(2 * Math.PI * 800 * t))) * 0.25 * Math.exp(-t * 12); } break;
+    case 'stab': mk(0.6); for (let i = 0; i < len; i++) { const t = i / sr; let v = 0;
+      for (const f of [261.6, 311.1, 392]) for (let h = 1; h <= 4; h++) v += Math.sin(2 * Math.PI * f * h * t) / h;
+      d[i] = v * Math.exp(-t * 5) * Math.min(1, t / 0.004); } break;
+    default: mk(0.2); for (let i = 0; i < len; i++) { const t = i / sr; d[i] = Math.sin(2 * Math.PI * 1320 * t) * Math.exp(-t * 25); }
+  }
+  let pk = 0; for (const v of d) pk = Math.max(pk, Math.abs(v));
+  if (pk) for (let i = 0; i < len; i++) d[i] *= 0.8 / pk;
+  return d;
+}
+function fillDemo() {
+  let n = 0;
+  for (let k = 0; k < 16; k++) {
+    const i = S.bank * 16 + k; if (S.pads[i]) continue;
+    const d = gen(DEMO[k][1], ctx.sampleRate);
+    const b = ctx.createBuffer(1, d.length, ctx.sampleRate); b.copyToChannel(d, 0);
+    S.pads[i] = newPad(b, DEMO[k][0]); savePad(i); n++;
+  }
+  return n;
+}
+
+// ---------------- load from Files ----------------
+let filePad = -1;
+$('fileIn').addEventListener('change', async e => {
+  const f = e.target.files[0]; e.target.value = '';
+  if (!f || filePad < 0) return;
+  try {
+    const ab = await f.arrayBuffer();
+    const dec = await new Promise((res, rej) => ctx.decodeAudioData(ab, res, rej));
+    const n = Math.min(dec.length, Math.floor(30 * dec.sampleRate));
+    const b = ctx.createBuffer(1, n, dec.sampleRate), d = b.getChannelData(0);
+    for (let c = 0; c < dec.numberOfChannels; c++) { const s = dec.getChannelData(c); for (let k = 0; k < n; k++) d[k] += s[k] / dec.numberOfChannels; }
+    S.padUndo = {i: filePad, prev: S.pads[filePad]};
+    S.pads[filePad] = newPad(b, f.name.replace(/\.[^.]+$/, ''));
+    savePad(filePad); SND.done(); render();
+    speak('Loaded ' + S.pads[filePad].name + ' into ' + padName(filePad) + '.');
+  } catch (err) { speak('That file could not be loaded.'); }
+});
+
+// ---------------- sequencer ----------------
+const T = {start: 0, sched: 0, timer: null};
+const spb = () => 60 / S.bpm;
+const loopBeats = () => S.bars * S.bpb;
+const wrap = (x, L) => ((x % L) + L) % L;
+function qBeat(b) {
+  const q = QUANTS[S.quant].v; if (!q) return b;
+  const L = loopBeats(); let r = Math.round(b / q) * q;
+  return r >= L ? r - L : r;
+}
+function click(t, accent, loud) {
+  const v = (loud ? 0.5 : 0.35) * (loud ? Math.max(S.metroVol, 0.5) : S.metroVol);
+  scheduled.push(Object.assign(tone(accent ? 1600 : 1000, 0.04, v, t, 'sine', master), {t}));
+}
+function startTransport(countBars) {
+  const sp = spb(), now = ctx.currentTime + 0.08;
+  const ci = countBars * S.bpb;
+  for (let b = 0; b < ci; b++) click(now + b * sp, b % S.bpb === 0, true);
+  T.start = now + ci * sp; T.sched = now;
+  S.playing = true;
+  S.tracks.forEach(startTrack);
+  clearInterval(T.timer); T.timer = setInterval(schedule, 25); schedule();
+}
+function stopTransport() {
+  clearInterval(T.timer); T.timer = null;
+  S.playing = false;
+  if (S.recording) stopRecording(true);
+  const now = ctx.currentTime;
+  for (const s of scheduled) if (s.t > now) silence(s);
+  scheduled.length = 0;
+  S.tracks.forEach(stopTrack);
+}
+function schedule() {
+  const now = ctx.currentTime, to = now + 0.12, from = Math.max(T.sched, T.start);
+  for (let k = scheduled.length - 1; k >= 0; k--) if (scheduled[k].t < now - 5) scheduled.splice(k, 1);
+  if (to <= from) return;
+  const sp = spb(), L = loopBeats(), b0 = (from - T.start) / sp, b1 = (to - T.start) / sp;
+  if (S.metro) for (let b = Math.ceil(b0 - 1e-9); b < b1; b++) click(T.start + b * sp, b % S.bpb === 0, false);
+  const qMax = QUANTS[S.quant].v * sp + 0.05;
+  for (let k = Math.floor(b0 / L); k <= Math.floor(b1 / L); k++) {
+    for (const ev of S.events) {
+      if (ev.beat >= L) continue;
+      const eb = qBeat(ev.beat) + k * L;
+      if (eb < b0 || eb >= b1) continue;
+      const t = T.start + eb * sp;
+      if (ev.born && t < ev.born + qMax) continue;   // just played live
+      playPad(ev.pad, t);
+    }
+  }
+  T.sched = to;
+}
+function startTrack(tr) {
+  stopTrack(tr); if (!S.playing) return;
+  const t = Math.max(ctx.currentTime + 0.03, T.start), dur = tr.buf.duration;
+  const src = ctx.createBufferSource(), g = ctx.createGain();
+  src.buffer = tr.buf; src.loop = true; g.gain.value = tr.muted ? 0 : tr.vol;
+  src.connect(g); g.connect(master);
+  src.start(t, wrap(t - T.start, dur));
+  tr.src = src; tr.g = g;
+}
+function stopTrack(tr) { if (tr.src) { try { tr.src.stop(); } catch (e) {} tr.src = null; } }
+function trackGain(tr) { if (tr.g) tr.g.gain.setTargetAtTime(tr.muted ? 0 : tr.vol, ctx.currentTime, 0.01); }
+
+function togglePlay() {
+  if (S.playing) { stopTransport(); SND.close(); speak('Stopped.'); }
+  else { startTransport(0); speak('Playing.'); }
+  render();
+}
+function setTempo(v) {
+  if (S.tracks.length) { speak('Tempo is locked while loop tracks exist.'); return false; }
+  v = clamp(Math.round(v), 40, 240);
+  if (S.playing) { const pos = (ctx.currentTime - T.start) / spb(); S.bpm = v; T.start = ctx.currentTime - pos * spb(); }
+  else S.bpm = v;
+  return true;
+}
+function tapTempo() {
+  const now = performance.now();
+  if (S.taps.length && now - S.taps[S.taps.length - 1] > 2000) S.taps = [];
+  S.taps.push(now); if (S.taps.length > 5) S.taps.shift();
+  SND.tick(); hush();
+  clearTimeout(S.tapTimer);
+  S.tapTimer = setTimeout(() => {
+    if (S.taps.length >= 3) {
+      const iv = (S.taps[S.taps.length - 1] - S.taps[0]) / (S.taps.length - 1);
+      if (setTempo(60000 / iv)) { speak('Tempo ' + S.bpm); saveState(); render(); }
+    } else speak('Keep tapping, at least 3 taps.');
+    S.taps = [];
+  }, 1300);
+}
+function startRecording() {
+  S.takeId++; S.curTake = S.takeId; S.recording = true;
+  const wasPlaying = S.playing;
+  if (!wasPlaying) startTransport(S.countIn);
+  enterSurface(true);
+  if (wasPlaying || !S.countIn) speak('Recording.');
+}
+function stopRecording(quiet) {
+  S.recording = false;
+  const n = S.events.filter(e => e.take === S.curTake).length;
+  if (n) S.takes.push(S.curTake);
+  saveState();
+  if (!quiet) speak('Recording stopped. ' + n + (n === 1 ? ' hit' : ' hits') + ' recorded.');
+}
+function undoTake() {
+  if (!S.takes.length) { speak('Nothing to undo.'); return; }
+  const id = S.takes.pop(), before = S.events.length;
+  S.events = S.events.filter(e => e.take !== id);
+  speak('Removed last take, ' + (before - S.events.length) + ' hits.');
+}
+function clearPattern() { S.events = []; S.takes = []; speak('Pattern cleared.'); }
+async function bounce() {
+  const evs = S.events.filter(e => e.beat < loopBeats() && S.pads[e.pad]);
+  if (!evs.length) { speak('The pattern is empty.'); return; }
+  if (S.tracks.length >= 8) { speak('All 8 loop tracks are full.'); return; }
+  speak('Bouncing.');
+  const sr = ctx.sampleRate, sp = spb(), dur = loopBeats() * sp, n = Math.round(dur * sr);
+  const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const oc = new OAC(2, n + Math.round(4 * sr), sr), chokes = {};
+  evs.map(ev => ({pad: ev.pad, t: qBeat(ev.beat) * sp})).sort((x, y) => x.t - y.t)
+     .forEach(e => makeVoice(oc, oc.destination, e.pad, e.t, chokes));
+  const r = await new Promise(res => { oc.oncomplete = e => res(e.renderedBuffer); const pr = oc.startRendering(); if (pr && pr.then) pr.then(res); });
+  const out = ctx.createBuffer(2, n, sr);
+  for (let c = 0; c < 2; c++) {                              // fold tails onto the loop start
+    const d = out.getChannelData(c), s = r.getChannelData(c);
+    for (let k = 0; k < s.length; k++) d[k % n] += s[k];
+  }
+  const tr = {buf: out, bars: S.bars, vol: 1, muted: false};
+  S.tracks.push(tr); startTrack(tr);
+  S.events = []; S.takes = [];
+  saveTracks(); saveState(); SND.done(); render();
+  speak('Bounced to loop track ' + S.tracks.length + '. Pattern cleared, ready for the next layer.');
+}
+
+// ---------------- play surface ----------------
+const SG = {active: new Set(), group: [], groupT: 0, cmd: false};
+function enterSurface(rec) {
+  S.surface = true; S.menu = null; SG.active.clear(); SG.cmd = false;
+  SND.open(); render();
+  if (!rec) speak('Play surface, bank ' + BANKS[S.surfaceBank] + '. Three-finger tap to leave.');
+}
+function exitSurface() {
+  S.surface = false; SND.close();
+  if (S.recording) stopRecording(false); else speak('Controls. ' + itemText(seqItems()[S.seqIdx]));
+  render();
+}
+function surfStart(e) {
+  unlock();
+  const now = performance.now(), r = $('gl').getBoundingClientRect();
+  for (const t of e.changedTouches) {
+    SG.active.add(t.identifier);
+    if (now - SG.groupT > 90) { SG.group = []; SG.groupT = now; }
+    const col = clamp(Math.floor((t.clientX - r.left) / r.width * 4), 0, 3);
+    const row = clamp(Math.floor((t.clientY - r.top) / r.height * 4), 0, 3);
+    const pad = S.surfaceBank * 16 + row * 4 + col;
+    const hit = {v: null, ev: null};
+    if (S.pads[pad]) {
+      hit.v = playPad(pad);
+      if (S.recording) {
+        const lat = (ctx.outputLatency || 0) + (ctx.baseLatency || 0);
+        const now2 = ctx.currentTime;
+        hit.ev = {pad, beat: wrap((now2 - lat - T.start) / spb(), loopBeats()), take: S.curTake, born: now2};
+        S.events.push(hit.ev);
+      }
+    } else SND.empty();
+    SG.group.push(hit);
+    flash(row * 4 + col);
+  }
+  if (SG.group.length >= 3 && !SG.cmd) {       // three fingers = leave, erase those stray hits
+    SG.cmd = true;
+    for (const h of SG.group) {
+      silence(h.v);
+      if (h.ev) S.events = S.events.filter(x => x !== h.ev);
+    }
+  }
+}
+function surfEnd(e) {
+  for (const t of e.changedTouches) SG.active.delete(t.identifier);
+  if (!SG.active.size && SG.cmd) { SG.cmd = false; exitSurface(); }
+}
+function flash(k) {
+  const el = document.querySelector('[data-k="' + k + '"]'); if (!el) return;
+  el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 110);
+}
+
+// ---------------- menus & lists ----------------
+function itemText(it) { if (!it) return ''; const v = it.v ? it.v() : ''; return it.l() + (v ? ', ' + v : ''); }
+function confirmThen(key, fn) {
+  return () => {
+    if (S.confirm === key && performance.now() < S.confirmT) { S.confirm = null; fn(); }
+    else { S.confirm = key; S.confirmT = performance.now() + 3000; speak('Tap again to confirm.'); }
+    return 'quiet';
+  };
+}
+function padDesc(i) {
+  const p = S.pads[i];
+  if (!p) return padName(i) + ', empty';
+  return padName(i) + ', ' + (p.name || 'recorded') + ', ' + padLen(p).toFixed(2) + ' seconds' + (isEdited(p) ? ', edited' : '') + (p.vol !== 1 ? ', volume ' + pct(p.vol) : '');
+}
+const STEPS = [{n: 'fine, 5 milliseconds', v: 0.005}, {n: 'medium, 20 milliseconds', v: 0.02}, {n: 'coarse, 100 milliseconds', v: 0.1}];
+const secs = v => v.toFixed(3).replace(/0+$/, '').replace(/\.$/, '') + ' seconds';
+function signed(v, unit) { return v === 0 ? 'none' : (v > 0 ? 'plus ' : 'minus ') + Math.abs(v) + ' ' + unit; }
+function panText(v) { return Math.abs(v) < 0.05 ? 'center' : Math.round(Math.abs(v) * 100) + ' percent ' + (v < 0 ? 'left' : 'right'); }
+function editMenu(i) {
+  const P = () => S.pads[i], step = () => STEPS[S.editStep].v;
+  const ed = fn => d => { const p = P(); if (!p) return; fn(p, d); savePad(i); };
+  return {title: 'Edit ' + padName(i), idx: 0, items: [
+    {l: () => 'Preview', a: () => { preview(i); return 'quiet'; }, h: 'Plays the sound with all edits.'},
+    {l: () => 'Edit step', v: () => STEPS[S.editStep].n, adj: d => { S.editStep = clamp(S.editStep + d, 0, 2); },
+      h: 'How far each swipe moves the start, end and fades.'},
+    {l: () => 'Start', v: () => secs(P().start) + ', length ' + padLen(P()).toFixed(2),
+      adj: ed((p, d) => { p.start = clamp(+(p.start + d * step()).toFixed(3), 0, padEnd(p) - 0.01); preview(i, {head: true}); }),
+      h: 'Trims the beginning. Swipe right to cut more. You hear the first part of the sound after each change.'},
+    {l: () => 'End', v: () => secs(padEnd(P())) + ', length ' + padLen(P()).toFixed(2),
+      adj: ed((p, d) => { const e = clamp(+(padEnd(p) + d * step()).toFixed(3), p.start + 0.01, p.buf.duration); p.end = e >= p.buf.duration ? null : e; preview(i, {tail: true}); }),
+      h: 'Trims the ending. Swipe left to cut more. You hear the last part of the sound after each change.'},
+    {l: () => 'Pitch', v: () => signed(P().pitch, 'semitones'), adj: ed((p, d) => { p.pitch = clamp(p.pitch + d, -24, 24); preview(i, {head: true}); }),
+      h: 'Changes pitch in semitones, up to two octaves either way. Higher pitch also makes the sound shorter.'},
+    {l: () => 'Fine tune', v: () => signed(P().fine, 'cents'), adj: ed((p, d) => { p.fine = clamp(p.fine + d * 5, -50, 50); preview(i, {head: true}); })},
+    {l: () => 'Reverse', v: () => P().rev ? 'on' : 'off', a: () => { const p = P(); p.rev = !p.rev; savePad(i); preview(i); },
+      adj: ed(p => { p.rev = !p.rev; preview(i); })},
+    {l: () => 'Fade in', v: () => secs(P().fadeIn), adj: ed((p, d) => { p.fadeIn = clamp(+(p.fadeIn + d * step()).toFixed(3), 0, 2); preview(i); })},
+    {l: () => 'Fade out', v: () => secs(P().fadeOut), adj: ed((p, d) => { p.fadeOut = clamp(+(p.fadeOut + d * step()).toFixed(3), 0, 2); preview(i); })},
+    {l: () => 'Pan', v: () => panText(P().pan), adj: ed((p, d) => { p.pan = clamp(round1(p.pan + d * 0.1), -1, 1); preview(i, {head: true}); }),
+      h: 'Places the sound left or right. Use headphones to hear it.'},
+    {l: () => 'Volume', v: () => pct(P().vol), adj: ed((p, d) => { p.vol = clamp(round1(p.vol + d * 0.1), 0, 2); preview(i, {head: true}); })},
+    {l: () => 'Play mode', v: () => P().mono ? 'choke, a new hit cuts off the last one' : 'one-shot, hits can overlap',
+      a: () => { const p = P(); p.mono = !p.mono; savePad(i); }, adj: ed(p => { p.mono = !p.mono; }),
+      h: 'Choke is good for open hats, long notes and vocal chops. One-shot lets each hit ring out.'},
+    {l: () => 'Reset all edits', a: confirmThen('reset' + i, () => { const p = P(); Object.assign(p, EDIT_DEFAULTS); savePad(i); speak('Edits reset.'); preview(i); })},
+    {l: () => 'Back to pad menu', a: () => { back(); return 'quiet'; }}
+  ]};
+}
+function padMenu(i) {
+  const items = [
+    {l: () => 'Play', a: () => { if (!playPad(i)) speak('Empty.'); return 'quiet'; }},
+    {l: () => 'Edit sound', v: () => S.pads[i] && isEdited(S.pads[i]) ? 'edited' : '', a: () => {
+      if (!S.pads[i]) { speak('Pad is empty. Record something first.'); return 'quiet'; }
+      S.menu = Object.assign(editMenu(i), {parent: S.menu}); SND.open(); render();
+      speak(S.menu.title + '. ' + itemText(S.menu.items[0]) + ', 1 of ' + S.menu.items.length); return 'quiet'; },
+      h: 'Trim, pitch, reverse, fades, pan, volume and play mode. Edits never change your original recording.'},
+    {l: () => 'Load sound from Files', a: () => { filePad = i; $('fileIn').click(); return 'quiet'; }, h: 'Opens the Files picker. VoiceOver may be needed to use the picker.'},
+    {l: () => 'Copy', a: () => { if (!S.pads[i]) { speak('Pad is empty.'); return 'quiet'; } S.clip = Object.assign({}, S.pads[i]); speak('Copied.'); return 'quiet'; }},
+    {l: () => 'Paste', v: () => S.clip ? (S.clip.name || 'recorded sound') : 'clipboard empty', a: () => {
+      if (!S.clip) { speak('Nothing copied.'); return 'quiet'; }
+      S.padUndo = {i, prev: S.pads[i]}; S.pads[i] = Object.assign({}, S.clip); savePad(i); speak('Pasted.'); return 'quiet'; }},
+    {l: () => 'Restore previous sound', v: () => (S.padUndo && S.padUndo.i === i) ? 'available' : 'nothing to restore', a: () => {
+      if (!S.padUndo || S.padUndo.i !== i) { speak('Nothing to restore.'); return 'quiet'; }
+      S.pads[i] = S.padUndo.prev; S.padUndo = null; savePad(i); speak('Restored.'); return 'quiet'; }},
+    {l: () => 'Clear pad', a: confirmThen('clear' + i, () => { S.padUndo = {i, prev: S.pads[i]}; S.pads[i] = null; savePad(i); speak('Cleared.'); })},
+    {l: () => 'Fill empty pads in bank ' + BANKS[S.bank] + ' with demo sounds', a: () => { const n = fillDemo(); speak(n ? 'Added ' + n + ' demo sounds.' : 'No empty pads in this bank.'); return 'quiet'; },
+      h: 'Puts a synthesized drum kit, bass notes and a chord into any empty pads in this bank.'},
+    {l: () => 'Close menu', a: () => { back(); return 'quiet'; }}
+  ];
+  return {title: 'Pad ' + padName(i) + ' menu', items, idx: 0};
+}
+function trackMenu(ti) {
+  const tr = S.tracks[ti];
+  return {title: 'Loop track ' + (ti + 1) + ' menu', idx: 0, items: [
+    {l: () => tr.muted ? 'Unmute' : 'Mute', a: () => { tr.muted = !tr.muted; trackGain(tr); saveTracks(); speak(tr.muted ? 'Muted.' : 'Unmuted.'); return 'quiet'; }},
+    {l: () => 'Volume', v: () => pct(tr.vol), adj: d => { tr.vol = clamp(round1(tr.vol + d * 0.1), 0, 1.5); trackGain(tr); saveTracks(); }},
+    {l: () => 'Delete track', a: confirmThen('del' + ti, () => {
+      stopTrack(tr); S.tracks.splice(ti, 1); saveTracks(); S.menu = null; S.seqIdx = Math.min(S.seqIdx, seqItems().length - 1);
+      speak('Track deleted. ' + itemText(seqItems()[S.seqIdx])); })},
+    {l: () => 'Close menu', a: () => { back(); return 'quiet'; }}
+  ]};
+}
+function seqItems() {
+  const it = [
+    {l: () => S.playing ? 'Stop' : 'Play', v: () => S.playing ? 'playing' : 'stopped', a: () => { togglePlay(); return 'quiet'; },
+      h: 'Starts or stops the loop. Three-finger tap does this from anywhere.'},
+    {l: () => 'Record', a: () => { startRecording(); return 'quiet'; },
+      h: 'Records pad hits into the pattern and opens the play surface. When stopped, you hear the count-in first. Each pass layers on top. Three-finger tap on the surface stops recording.'},
+    {l: () => 'Play surface', a: () => { enterSurface(false); return 'quiet'; }, h: 'Opens the 16 pads as a 4 by 4 playing grid, top left is pad 1, without recording.'},
+    {l: () => 'Surface bank', v: () => BANKS[S.surfaceBank], adj: d => { S.surfaceBank = clamp(S.surfaceBank + d, 0, 3); }},
+    {l: () => 'Tempo', v: () => S.bpm + ' BPM', adj: d => { setTempo(S.bpm + d); }, a: () => { tapTempo(); return 'quiet'; },
+      h: 'Swipe right or left to change by 1. Or tap 3 or more times in time to set it by tapping.'},
+    {l: () => 'Beats per bar', v: () => String(S.bpb), adj: d => { S.bpb = clamp(S.bpb + d, 2, 7); }},
+    {l: () => 'Loop length', v: () => S.bars + (S.bars === 1 ? ' bar' : ' bars'), adj: d => { const o = [1, 2, 4, 8, 16]; S.bars = o[clamp(o.indexOf(S.bars) + d, 0, 4)]; }},
+    {l: () => 'Metronome', v: () => S.metro ? 'on' : 'off', a: () => { S.metro = !S.metro; }, adj: () => { S.metro = !S.metro; }},
+    {l: () => 'Metronome volume', v: () => pct(S.metroVol), adj: d => { S.metroVol = clamp(round1(S.metroVol + d * 0.1), 0, 1); }},
+    {l: () => 'Count-in', v: () => S.countIn ? S.countIn + (S.countIn === 1 ? ' bar' : ' bars') : 'off', adj: d => { S.countIn = clamp(S.countIn + d, 0, 2); }},
+    {l: () => 'Quantize', v: () => QUANTS[S.quant].n, adj: d => { S.quant = clamp(S.quant + d, 0, QUANTS.length - 1); },
+      h: 'Snaps hits to the beat grid when they play back. Your original timing is kept, so you can change this any time.'},
+    {l: () => 'Undo last take', v: () => S.takes.length ? S.takes.length + (S.takes.length === 1 ? ' take' : ' takes') : 'nothing to undo', a: () => { undoTake(); return 'quiet'; }},
+    {l: () => 'Clear pattern', v: () => S.events.length + (S.events.length === 1 ? ' hit' : ' hits'), a: confirmThen('clearPat', clearPattern)},
+    {l: () => 'Bounce pattern to loop track', a: () => { bounce(); return 'quiet'; },
+      h: 'Turns the pattern into an audio loop track, then clears the pattern so you can record the next layer. Up to 8 tracks. Tempo locks while tracks exist.'}
+  ];
+  S.tracks.forEach((tr, ti) => it.push({
+    l: () => 'Loop track ' + (ti + 1), v: () => tr.bars + (tr.bars === 1 ? ' bar' : ' bars') + ', ' + (tr.muted ? 'muted' : 'on') + ', volume ' + pct(tr.vol),
+    a: () => { tr.muted = !tr.muted; trackGain(tr); saveTracks(); }, adj: d => { tr.vol = clamp(round1(tr.vol + d * 0.1), 0, 1.5); trackGain(tr); saveTracks(); },
+    menu: () => trackMenu(ti), h: 'Tap to mute or unmute. Swipe left or right for volume. Two-finger tap for more, including delete.'
+  }));
+  return it;
+}
+function curList() {
+  if (S.menu) return {items: S.menu.items, get: () => S.menu.idx, set: v => S.menu.idx = v};
+  if (S.tab === 'sequence') return {items: seqItems(), get: () => S.seqIdx, set: v => S.seqIdx = v};
+  return null;
+}
+
+// ---------------- actions ----------------
+function gridMove(dir) {
+  const r = Math.floor(S.focus / 4), c = S.focus % 4;
+  let nr = r, nc = c;
+  if (dir === 'up') nr--; if (dir === 'down') nr++; if (dir === 'left') nc--; if (dir === 'right') nc++;
+  if (nr < 0 || nr > 3 || nc < 0 || nc > 3) { SND.edge(); return; }
+  S.focus = nr * 4 + nc; SND.tick(); render();
+  speak(padDesc(S.bank * 16 + S.focus));
+}
+function listMove(dir) {
+  const L = curList(); if (!L) return;
+  const it = L.items[L.get()];
+  if (dir === 'up' || dir === 'down') {
+    const n = L.get() + (dir === 'down' ? 1 : -1);
+    if (n < 0 || n >= L.items.length) { SND.edge(); return; }
+    L.set(n); SND.tick(); render(); speak(itemText(L.items[n]));
+  } else {
+    if (!it.adj) { SND.edge(); return; }
+    it.adj(dir === 'right' ? 1 : -1); SND.tick(); saveState(); render();
+    speak(it.v ? it.v() : it.l());
+  }
+}
+function activate() {
+  if (S.tab === 'sample' && !S.menu) {
+    const i = S.bank * 16 + S.focus;
+    if (!playPad(i)) { SND.empty(); speak(padName(i) + ', empty. Touch and hold to record.'); }
+    return;
+  }
+  const L = curList(), it = L.items[L.get()];
+  if (!it.a) { SND.edge(); speak(itemText(it)); return; }
+  if (it !== undefined && it.l() !== 'Tempo') SND.act();
+  const res = it.a();
+  saveState(); render();
+  if (res !== 'quiet') speak(itemText(curList().items[curList().get()]));
+}
+function openMenu() {
+  if (S.menu) { activate(); return; }
+  if (S.tab === 'sample') { S.menu = padMenu(S.bank * 16 + S.focus); }
+  else { const it = seqItems()[S.seqIdx]; if (it.menu) S.menu = it.menu(); else { activate(); return; } }
+  SND.open(); render();
+  speak(S.menu.title + '. ' + itemText(S.menu.items[0]) + ', 1 of ' + S.menu.items.length);
+}
+function back() {
+  if (S.menu && S.menu.parent) {
+    S.menu = S.menu.parent; SND.close(); render();
+    speak(S.menu.title + '. ' + itemText(S.menu.items[S.menu.idx]));
+  } else if (S.menu) {
+    S.menu = null; SND.close(); render();
+    speak(S.tab === 'sample' ? padDesc(S.bank * 16 + S.focus) : itemText(seqItems()[S.seqIdx]));
+  } else SND.edge();
+}
+function changeBank(d) {
+  const n = S.bank + d; if (n < 0 || n > 3) { SND.edge(); return; }
+  S.bank = n; SND.bank(); saveState(); render();
+  const full = S.pads.slice(n * 16, n * 16 + 16).filter(Boolean).length;
+  speak('Bank ' + BANKS[n] + ', ' + full + ' of 16 recorded. ' + padDesc(n * 16 + S.focus));
+}
+function switchTab(d) {
+  const tabs = ['sample', 'sequence'], n = tabs.indexOf(S.tab) + d;
+  if (n < 0 || n >= tabs.length) { SND.edge(); return; }
+  S.tab = tabs[n]; S.menu = null; SND.bank(); render();
+  if (S.tab === 'sample') speak('Sample tab, bank ' + BANKS[S.bank] + '. ' + padDesc(S.bank * 16 + S.focus));
+  else speak('Sequence tab. ' + itemText(seqItems()[S.seqIdx]));
+}
+function whereAmI() {
+  const loop = S.playing ? 'Loop playing.' : 'Loop stopped.';
+  if (S.menu) speak(S.menu.title + '. ' + itemText(S.menu.items[S.menu.idx]) + ', ' + (S.menu.idx + 1) + ' of ' + S.menu.items.length + '. ' + loop);
+  else if (S.tab === 'sample') { const full = S.pads.slice(S.bank * 16, S.bank * 16 + 16).filter(Boolean).length;
+    speak('Sample tab, bank ' + BANKS[S.bank] + ', ' + full + ' of 16 recorded. ' + loop); }
+  else speak('Sequence tab. ' + S.bpm + ' BPM, ' + S.bars + ' bars of ' + S.bpb + '. ' + loop + ' Pattern has ' + S.events.length + ' hits, ' + S.tracks.length + ' loop tracks.');
+}
+function rateChange(d) { S.rate = clamp(round1(S.rate + d * 0.1), 0.5, 2); saveState(); speak('Speech rate ' + Math.round(S.rate * 100) + ' percent'); }
+function help() {
+  let t;
+  if (S.menu) t = 'Menu. Swipe up or down to move. Swipe left or right to change a value. Tap to choose. Touch and hold to hear a description. Two-finger swipe down closes the menu.';
+  else if (S.tab === 'sample') t = 'Sample tab. Swipe in any direction to move between the 16 pads. Tap plays the focused pad. Touch and hold to record: wait for the beep, make your sound, then lift. Two-finger tap opens the pad menu. Two-finger swipe left or right changes bank.';
+  else t = 'Sequence tab. Swipe up or down to move through controls. Swipe left or right to change a setting. Tap to activate. Touch and hold to hear a description. Two-finger tap on a loop track opens its menu.';
+  t += ' Everywhere: three-finger tap plays or stops the loop. Three-finger swipe left or right changes tab. Three-finger swipe up or down changes speech rate. Two-finger swipe up says where you are. Two-finger double tap stops speech. Four-finger tap is help.';
+  speak(t);
+}
+
+// ---------------- gestures ----------------
+const G = {pts: new Map(), all: [], max: 0, t0: 0, hold: null, held: false, lastTap2: 0, tap2Timer: null};
+function holdFire() {
+  G.held = true;
+  if (S.tab === 'sample' && !S.menu) startPadRecord();
+  else { const L = curList(); const it = L && L.items[L.get()]; if (it) speak(it.h || itemText(it)); }
+}
+function holdEnd() { if (S.capturing) stopPadRecord(); }
+function classify() {
+  const dur = performance.now() - G.t0, n = G.max;
+  let dx = 0, dy = 0; for (const p of G.all) { dx += p.x - p.x0; dy += p.y - p.y0; }
+  dx /= G.all.length; dy /= G.all.length;
+  const d = Math.hypot(dx, dy);
+  if (d > 40 && dur < 900) {
+    const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
+    onSwipe(n, dir);
+  } else if (d < 30 && dur < 400) {
+    if (n === 2) {
+      const now = performance.now();
+      if (now - G.lastTap2 < 350) { clearTimeout(G.tap2Timer); G.lastTap2 = 0; hush(); }
+      else { G.lastTap2 = now; G.tap2Timer = setTimeout(() => openMenu(), 300); }
+    } else onTap(n);
+  }
+}
+function onSwipe(n, dir) {
+  if (n === 1) { if (S.tab === 'sample' && !S.menu) gridMove(dir); else listMove(dir); }
+  else if (n === 2) {
+    if (dir === 'down') back();
+    else if (dir === 'up') whereAmI();
+    else if (S.tab === 'sample' && !S.menu) changeBank(dir === 'right' ? 1 : -1);
+    else SND.edge();
+  } else if (n === 3) {
+    if (dir === 'left' || dir === 'right') switchTab(dir === 'right' ? 1 : -1);
+    else rateChange(dir === 'up' ? 1 : -1);
+  }
+}
+function onTap(n) {
+  if (n === 1) activate();
+  else if (n === 3) togglePlay();
+  else if (n >= 4) help();
+}
+const gl = $('gl');
+gl.addEventListener('touchstart', e => {
+  e.preventDefault(); if (!started) return; unlock();
+  if (S.surface) { surfStart(e); return; }
+  if (G.pts.size === 0) { G.all = []; G.max = 0; G.held = false; G.t0 = performance.now(); clearTimeout(G.hold); G.hold = setTimeout(holdFire, 450); }
+  for (const t of e.changedTouches) { const p = {x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY}; G.pts.set(t.identifier, p); G.all.push(p); }
+  G.max = Math.max(G.max, G.pts.size);
+  if (G.max > 1) clearTimeout(G.hold);
+}, {passive: false});
+gl.addEventListener('touchmove', e => {
+  e.preventDefault(); if (S.surface) return;
+  for (const t of e.changedTouches) {
+    const p = G.pts.get(t.identifier); if (!p) continue;
+    p.x = t.clientX; p.y = t.clientY;
+    if (!G.held && Math.hypot(p.x - p.x0, p.y - p.y0) > 15) clearTimeout(G.hold);
+  }
+}, {passive: false});
+function tEnd(e) {
+  e.preventDefault(); if (!started) return;
+  if (S.surface) { surfEnd(e); return; }
+  for (const t of e.changedTouches) G.pts.delete(t.identifier);
+  if (G.pts.size) return;
+  clearTimeout(G.hold);
+  if (G.held) { G.held = false; holdEnd(); return; }
+  if (G.all.length) classify();
+}
+gl.addEventListener('touchend', tEnd, {passive: false});
+gl.addEventListener('touchcancel', tEnd, {passive: false});
+
+// keyboard (for testing on a laptop)
+const SURF_KEYS = '1234qwerasdfzxcv';
+let spaceDown = false;
+document.addEventListener('keydown', e => {
+  if (!started || e.repeat && e.key !== ' ') return;
+  unlock();
+  if (S.surface) {
+    const k = SURF_KEYS.indexOf(e.key.toLowerCase());
+    if (k >= 0) { const fake = {changedTouches: [{identifier: 'k' + k, clientX: (k % 4 + 0.5) * innerWidth / 4, clientY: (Math.floor(k / 4) + 0.5) * innerHeight / 4}]}; surfStart(fake); SG.active.delete('k' + k); }
+    if (e.key === 'Escape') exitSurface();
+    e.preventDefault(); return;
+  }
+  const arrows = {ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right'};
+  if (arrows[e.key]) { e.shiftKey ? onSwipe(3, arrows[e.key]) : onSwipe(1, arrows[e.key]); }
+  else if (e.key === 'Enter') onTap(1);
+  else if (e.key === ' ') { if (!spaceDown) { spaceDown = true; holdFire(); } }
+  else if (e.key === 'Escape') back();
+  else if (e.key === 'm') openMenu();
+  else if (e.key === '[' || e.key === ']') onSwipe(2, e.key === ']' ? 'right' : 'left');
+  else if (e.key === 'p') togglePlay();
+  else if (e.key === 'h') help();
+  else if (e.key === 'w') whereAmI();
+  else return;
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => { if (e.key === ' ' && spaceDown) { spaceDown = false; G.held = false; holdEnd(); } });
+
+// ---------------- rendering (visual, for sighted collaborators) ----------------
+function render() {
+  $('tSample').className = S.tab === 'sample' ? 'on' : '';
+  $('tSeq').className = S.tab === 'sequence' ? 'on' : '';
+  const left = S.surface ? 'Play surface, bank ' + BANKS[S.surfaceBank] : S.tab === 'sample' ? 'Bank ' + BANKS[S.bank] : S.bpm + ' BPM, ' + S.bars + ' bars of ' + S.bpb;
+  const right = S.capturing ? '<span class="rec">● Recording pad</span>' : S.recording ? '<span class="rec">● Recording</span>' : S.playing ? '▶ Playing' : '■ Stopped';
+  $('info').innerHTML = '<span>' + left + '</span><span>' + right + '</span>';
+  const m = $('main');
+  if (S.surface) {
+    let h = '<div class="grid">';
+    for (let k = 0; k < 16; k++) { const i = S.surfaceBank * 16 + k, p = S.pads[i];
+      h += '<div class="pad' + (p ? ' full' : '') + '" data-k="' + k + '"><b>' + padName(i) + '</b>' + (p ? esc(p.name || 'rec') : '') + '</div>'; }
+    m.innerHTML = h + '</div>';
+  } else if (S.menu || S.tab === 'sequence') {
+    const L = curList(); const idx = L.get();
+    const start = Math.max(0, Math.min(idx - 4, L.items.length - 10));
+    let h = '<div class="list">' + (S.menu ? '<h2>' + esc(S.menu.title) + '</h2>' : '');
+    L.items.slice(start, start + 10).forEach((it, j) => {
+      h += '<div class="item' + (start + j === idx ? ' focus' : '') + '"><span>' + esc(it.l()) + '</span><span>' + esc(it.v ? it.v() : '') + '</span></div>'; });
+    m.innerHTML = h + '</div>';
+  } else {
+    let h = '<div class="grid">';
+    for (let k = 0; k < 16; k++) { const i = S.bank * 16 + k, p = S.pads[i];
+      h += '<div class="pad' + (p ? ' full' : '') + (k === S.focus ? ' focus' : '') + (S.capturing && cap.pad === i ? ' recording' : '') + '"><b>' + padName(i) + '</b>' +
+        (p ? esc(p.name || 'rec') + ' ' + p.buf.duration.toFixed(1) + 's' : 'empty') + '</div>'; }
+    m.innerHTML = h + '</div>';
+  }
+}
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])); }
+
+// ---------------- start ----------------
+$('startBtn').addEventListener('click', async () => {
+  initAudio(); unlock();
+  speak('Starting Loop Lab.');
+  const micP = ensureMic();
+  const n = await loadAll();
+  await micP;
+  $('start').remove(); started = true; render();
+  speak('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
+    (mic ? '' : 'Microphone is not available, so use Load from Files or demo sounds in the pad menu. ') +
+    'Sample tab, bank ' + BANKS[S.bank] + '. ' + padDesc(S.bank * 16 + S.focus) + '. Four-finger tap for help.');
+});
+document.addEventListener('visibilitychange', () => { if (document.hidden && S.capturing) stopPadRecord(); });
+</script>
+</body>
+</html>
