@@ -79,7 +79,7 @@ const S = {
   tracks: [],                           // {buf, bars, vol, muted, src, g}
   playing: false, recording: false, capturing: false,
   rate: 1.1, confirm: null, confirmT: 0, taps: [], editStep: 1, audioMode: 'playback',
-  voiceEngine: 'espeak', vPitch: 50, duck: true, esVoice: ''
+  voiceEngine: 'espeak', vPitch: 50, duck: true, esVoice: '', loopOffset: null, micLoop: null
 };
 let started = false;
 
@@ -123,7 +123,7 @@ async function rebuildAudio(quiet) {
 // Watchdog: if the engine's clock stops moving, try to resume, then rebuild.
 let wd = {last: -1, stuck: 0};
 setInterval(() => {
-  if (!started || !ctx || rebuilding || S.capturing) return;
+  if (!started || !ctx || rebuilding || S.capturing || S.micLoop) return;
   const t = ctx.currentTime;
   if (ctx.state === 'running' && t === wd.last) wd.stuck++; else wd.stuck = 0;
   wd.last = t;
@@ -318,7 +318,7 @@ function hushSpeech() {
 }
 function speak(text, interrupt = true) {
   $('status').textContent = text;
-  if (S.capturing) return;
+  if (S.capturing || S.micLoop) return;          // never talk into the microphone
   if (!useEspeak()) { sysSpeak(text, interrupt); return; }
   if (interrupt) { hushSpeech(); if (synth) synth.cancel(); }
   const gen = speechGen;
@@ -374,13 +374,13 @@ function savePad(i) {
   DB.put('pad' + i, rec);
 }
 function saveTracks() {
-  DB.put('tracks', S.tracks.map(t => Object.assign(bufToRec(t.buf), {bars: t.bars, vol: t.vol, muted: t.muted})));
+  DB.put('tracks', S.tracks.map(t => Object.assign(bufToRec(t.buf), {bars: t.bars, vol: t.vol, muted: t.muted, nudge: t.nudge || 0})));
 }
 let saveTimer = null;
 function saveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const k = ['bank','surfaceBank','bpm','bpb','bars','metro','metroVol','countIn','quant','events','takes','takeId','rate','editStep','audioMode','voiceEngine','vPitch','duck','esVoice'];
+    const k = ['bank','surfaceBank','bpm','bpb','bars','metro','metroVol','countIn','quant','events','takes','takeId','rate','editStep','audioMode','voiceEngine','vPitch','duck','esVoice','loopOffset'];
     const o = {}; k.forEach(x => o[x] = S[x]);
     DB.put('state', o);
   }, 300);
@@ -395,7 +395,7 @@ async function loadAll() {
     if (r) { const p = newPad(recToBuf(r), r.name); PAD_KEYS.forEach(k => { if (r[k] !== undefined) p[k] = r[k]; }); S.pads[i] = p; n++; }
   }
   const tr = await DB.get('tracks');
-  if (tr) S.tracks = tr.map(r => ({buf: recToBuf(r), bars: r.bars, vol: r.vol, muted: r.muted}));
+  if (tr) S.tracks = tr.map(r => ({buf: recToBuf(r), bars: r.bars, vol: r.vol, muted: r.muted, nudge: r.nudge || 0}));
   return n;
 }
 
@@ -435,7 +435,11 @@ function connectMic() {
   mic = ctx.createMediaStreamSource(micStream);
   if (!proc) {
     proc = ctx.createScriptProcessor(2048, 1, 1);
-    proc.onaudioprocess = e => { if (cap.on) cap.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    proc.onaudioprocess = e => {
+      const d = e.inputBuffer.getChannelData(0);
+      if (cap.on) cap.chunks.push(new Float32Array(d));
+      if (LC.on) LC.chunks.push({t: e.target.context.currentTime - e.inputBuffer.duration, d: new Float32Array(d)});
+    };
     const z = ctx.createGain(); z.gain.value = 0;
     proc.connect(z); z.connect(ctx.destination);
   }
@@ -736,6 +740,106 @@ async function bounce() {
   speak('Bounced to loop track ' + S.tracks.length + '. Pattern cleared, ready for the next layer.');
 }
 
+// ---------------- mic loop recording ----------------
+// Records the mic into a loop track in time with the transport. Start and stop
+// both snap to bar lines; short takes leave silence, long takes wrap and layer.
+const LC = {on: false, chunks: []};
+function loopOffsetSec() {
+  if (S.loopOffset != null) return S.loopOffset / 1000;
+  return ctx ? Math.round(((ctx.outputLatency || 0) + (ctx.baseLatency || 0)) * 1000) / 1000 : 0;
+}
+function micLoopMenu() {
+  const items = [];
+  if (S.tracks.length < 8) items.push({l: () => 'New loop track', a: () => { startMicLoop({mode: 'new'}); return 'quiet'; }});
+  S.tracks.forEach((tr, ti) => {
+    items.push({l: () => 'Layer onto loop track ' + (ti + 1), a: () => { startMicLoop({mode: 'layer', ti}); return 'quiet'; }});
+    items.push({l: () => 'Replace loop track ' + (ti + 1), a: () => { startMicLoop({mode: 'replace', ti}); return 'quiet'; }});
+  });
+  items.push({l: () => 'Cancel', a: () => { back(); return 'quiet'; }});
+  return {title: 'Record mic loop', idx: 0, items};
+}
+async function startMicLoop(target) {
+  if (S.micLoop || S.capturing || cap.busy) return;
+  if (target.mode === 'new' && S.tracks.length >= 8) { speak('All 8 loop tracks are full.'); return; }
+  S.menu = null; render();
+  speak('Get ready.');
+  await sleep(700); hush();
+  setSession('play-and-record');
+  const ok = await ensureMic(true);
+  if (!ok) { await afterMic(); speak('Microphone is not available.'); return; }
+  unlock();
+  const sp = spb(), bar = S.bpb * sp;
+  let startAt;
+  if (!S.playing) { startTransport(S.countIn); startAt = T.start; }
+  else { const b = (ctx.currentTime + 0.05 - T.start) / sp; startAt = T.start + Math.ceil(b / S.bpb) * bar; }
+  S.micLoop = {target, startAt, stopAt: null, maxAt: startAt + Math.max(bar, Math.min(64 * bar, 180)), timer: null};
+  LC.chunks = []; LC.on = true;
+  tone(1300, 0.06, 0.12); render();
+  S.micLoop.timer = setInterval(() => {
+    const m = S.micLoop; if (!m) return;
+    if (ctx.currentTime > (m.stopAt || m.maxAt) + 0.35 + Math.max(0, loopOffsetSec())) finishMicLoop();
+    else render();
+  }, 100);
+}
+function requestMicStop() {
+  const m = S.micLoop; if (!m || m.stopAt) return;
+  const bar = S.bpb * spb(), from = Math.max(ctx.currentTime, m.startAt + 0.001);
+  m.stopAt = m.startAt + Math.max(1, Math.ceil((from - m.startAt) / bar)) * bar;
+  tone(500, 0.07, 0.1); render();
+}
+function cancelMicLoop(say) {
+  const m = S.micLoop; if (!m) return;
+  clearInterval(m.timer); LC.on = false; LC.chunks = []; S.micLoop = null;
+  closeMic(); afterMic(); render();
+  if (say) speak('Mic loop cancelled.');
+}
+async function finishMicLoop() {
+  const m = S.micLoop; if (!m) return;
+  clearInterval(m.timer); LC.on = false; S.micLoop = null;
+  const chunks = LC.chunks; LC.chunks = [];
+  const sr = ctx.sampleRate, off = loopOffsetSec(), t0 = m.startAt, t1 = m.stopAt || m.maxAt;
+  const tg = m.target, old = tg.mode === 'new' ? null : S.tracks[tg.ti];
+  // the take, lined up to musical time
+  const take = new Float32Array(Math.ceil((t1 - t0) * sr));
+  for (const c of chunks) {
+    const first = Math.round((c.t - off - t0) * sr);
+    for (let k = 0; k < c.d.length; k++) { const idx = first + k; if (idx >= 0 && idx < take.length) take[idx] = c.d[k]; }
+  }
+  closeMic();
+  const peak = peakOf(take, take.length);
+  if (peak < 0.003) { await afterMic(); render(); speak('No sound was heard. Loop unchanged.'); return; }
+  const gain = Math.min(0.7 / peak, 10), fade = Math.floor(0.005 * sr);
+  for (let k = 0; k < take.length; k++) {
+    let v = take[k] * gain;
+    if (k < fade) v *= k / fade; else if (k > take.length - fade) v *= (take.length - k) / fade;
+    take[k] = v;
+  }
+  const dur = tg.mode === 'layer' && old ? old.buf.duration : loopBeats() * spb();
+  const n = Math.round(dur * sr), nb = ctx.createBuffer(2, n, sr);
+  const at = Math.round(wrap(t0 - T.start, dur) * sr);     // where the take lands in the loop cycle
+  for (let c = 0; c < 2; c++) {
+    const d = nb.getChannelData(c);
+    if (tg.mode === 'layer' && old) { const src = old.buf.getChannelData(Math.min(c, old.buf.numberOfChannels - 1)); d.set(src.subarray(0, n)); }
+    for (let k = 0; k < take.length; k++) d[(at + k) % n] += take[k];
+  }
+  let tr, num;
+  if (!old) { tr = {buf: nb, bars: S.bars, vol: 1, muted: false, nudge: 0}; S.tracks.push(tr); num = S.tracks.length; }
+  else { tr = old; tr.prevBuf = tr.buf; tr.buf = nb; if (tg.mode === 'replace') { tr.bars = S.bars; tr.nudge = 0; } num = tg.ti + 1; }
+  if (S.playing) startTrack(tr);
+  saveTracks(); await afterMic(); SND.done(); render();
+  const bars = Math.round((t1 - t0) / (S.bpb * spb()));
+  speak((tg.mode === 'layer' ? 'Layered onto' : tg.mode === 'replace' ? 'Replaced' : 'Recorded into') + ' loop track ' + num + ', ' + bars + (bars === 1 ? ' bar' : ' bars') + ' recorded.');
+}
+function nudgeTrack(tr, ms) {
+  const sr = tr.buf.sampleRate, n = tr.buf.length, k = ((Math.round(ms / 1000 * sr) % n) + n) % n;
+  const nb = ctx.createBuffer(tr.buf.numberOfChannels, n, sr);
+  for (let c = 0; c < nb.numberOfChannels; c++) {
+    const s = tr.buf.getChannelData(c), d = nb.getChannelData(c);
+    for (let i = 0; i < n; i++) d[(i + k) % n] = s[i];
+  }
+  tr.buf = nb; tr.nudge = (tr.nudge || 0) + ms; startTrack(tr); saveTracks();
+}
+
 // ---------------- play surface ----------------
 const SG = {active: new Set(), group: [], groupT: 0, cmd: false};
 function enterSurface(rec) {
@@ -863,6 +967,14 @@ function trackMenu(ti) {
   return {title: 'Loop track ' + (ti + 1) + ' menu', idx: 0, items: [
     {l: () => tr.muted ? 'Unmute' : 'Mute', a: () => { tr.muted = !tr.muted; trackGain(tr); saveTracks(); speak(tr.muted ? 'Muted.' : 'Unmuted.'); return 'quiet'; }},
     {l: () => 'Volume', v: () => pct(tr.vol), adj: d => { tr.vol = clamp(round1(tr.vol + d * 0.1), 0, 1.5); trackGain(tr); saveTracks(); }},
+    {l: () => 'Layer a mic recording', a: () => { startMicLoop({mode: 'layer', ti}); return 'quiet'; },
+      h: 'Records the microphone on top of this track. Tap to stop at the next bar line.'},
+    {l: () => 'Replace with a mic recording', a: () => { startMicLoop({mode: 'replace', ti}); return 'quiet'; }},
+    {l: () => 'Undo last layer', v: () => tr.prevBuf ? 'available' : 'nothing to undo', a: () => {
+      if (!tr.prevBuf) { speak('Nothing to undo.'); return 'quiet'; }
+      tr.buf = tr.prevBuf; tr.prevBuf = null; startTrack(tr); saveTracks(); speak('Last layer removed.'); return 'quiet'; }},
+    {l: () => 'Nudge timing', v: () => (tr.nudge || 0) + ' milliseconds', adj: d => nudgeTrack(tr, d * 5),
+      h: 'Shifts the whole track earlier or later by 5 milliseconds per swipe. Swipe left if it sounds late, right if it sounds early.'},
     {l: () => 'Delete track', a: confirmThen('del' + ti, () => {
       stopTrack(tr); S.tracks.splice(ti, 1); saveTracks(); S.menu = null; S.seqIdx = Math.min(S.seqIdx, seqItems().length - 1);
       speak('Track deleted. ' + itemText(seqItems()[S.seqIdx])); })},
@@ -890,6 +1002,14 @@ function seqItems() {
     {l: () => 'Clear pattern', v: () => S.events.length + (S.events.length === 1 ? ' hit' : ' hits'), a: confirmThen('clearPat', clearPattern)},
     {l: () => 'Bounce pattern to loop track', a: () => { bounce(); return 'quiet'; },
       h: 'Turns the pattern into an audio loop track, then clears the pattern so you can record the next layer. Up to 8 tracks. Tempo locks while tracks exist.'},
+    {l: () => 'Record mic loop', a: () => {
+      if (!S.tracks.length) { startMicLoop({mode: 'new'}); return 'quiet'; }
+      S.menu = micLoopMenu(); SND.open(); render();
+      speak(S.menu.title + '. ' + itemText(S.menu.items[0]) + ', 1 of ' + S.menu.items.length); return 'quiet'; },
+      h: 'Records your voice or instrument into a loop track, in time. Recording starts at the next bar line, after the count-in if stopped. Tap anywhere to stop at the next bar line. Two-finger swipe down cancels. Headphones keep the speaker out of the recording.'},
+    {l: () => 'Mic loop timing', v: () => Math.round(loopOffsetSec() * 1000) + ' milliseconds' + (S.loopOffset == null ? ', automatic' : ''),
+      adj: d => { S.loopOffset = clamp(Math.round(loopOffsetSec() * 1000) + d * 5, -200, 500); },
+      h: 'Corrects for the delay between the speaker and the microphone. If new mic loops sound late, swipe right. If early, swipe left.'},
     {l: () => 'Audio mode', v: () => AUDIO_MODES[S.audioMode],
       adj: d => { const k = Object.keys(AUDIO_MODES); S.audioMode = k[clamp(k.indexOf(S.audioMode) + d, 0, k.length - 1)]; setSession(S.audioMode); },
       h: 'Changes how iOS mixes Loop Lab sounds with its speech. Try each one if speech fades or cuts out. Mix with speech is muted by the ring silent switch.'},
@@ -954,6 +1074,7 @@ function activate() {
   if (res !== 'quiet') speak(itemText(curList().items[curList().get()]));
 }
 function openMenu() {
+  if (S.micLoop) return;
   if (S.menu) { activate(); return; }
   if (S.tab === 'sample') { S.menu = padMenu(S.bank * 16 + S.focus); }
   else { const it = seqItems()[S.seqIdx]; if (it.menu) S.menu = it.menu(); else { activate(); return; } }
@@ -1002,6 +1123,7 @@ function help() {
   if (S.menu) t = 'Menu. Swipe up or down to move. Swipe left or right to change a value. Tap to choose. Touch and hold to hear a description. Two-finger swipe down closes the menu.';
   else if (S.tab === 'sample') t = 'Sample tab. Swipe in any direction to move between the 16 pads. Tap plays the focused pad. Touch and hold to record: wait for the beep, make your sound, then lift. Two-finger tap opens the pad menu. Two-finger swipe left or right changes bank.';
   else t = 'Sequence tab. Swipe up or down to move through controls. Swipe left or right to change a setting. Tap to activate. Touch and hold to hear a description. Two-finger tap on a loop track opens its menu.';
+  t += ' While recording a mic loop: tap anywhere to stop at the next bar line, two-finger swipe down cancels.';
   t += ' Everywhere: three-finger tap plays or stops the loop. Three-finger swipe left or right changes tab. Three-finger swipe up or down changes speech rate. Two-finger swipe up says where you are. Two-finger double tap stops speech. Four-finger tap is help.';
   speak(t);
 }
@@ -1010,6 +1132,7 @@ function help() {
 const G = {pts: new Map(), all: [], max: 0, t0: 0, hold: null, held: false, lastTap2: 0, tap2Timer: null};
 function holdFire() {
   G.held = true;
+  if (S.micLoop) return;
   if (S.tab === 'sample' && !S.menu) startPadRecord();
   else { const L = curList(); const it = L && L.items[L.get()]; if (it) speak(it.h || itemText(it)); }
 }
@@ -1031,6 +1154,7 @@ function classify() {
   }
 }
 function onSwipe(n, dir) {
+  if (S.micLoop) { if (n === 2 && dir === 'down') cancelMicLoop(true); return; }
   if (n === 1) { if (S.tab === 'sample' && !S.menu) gridMove(dir); else listMove(dir); }
   else if (n === 2) {
     if (dir === 'down') back();
@@ -1043,6 +1167,7 @@ function onSwipe(n, dir) {
   }
 }
 function onTap(n) {
+  if (S.micLoop) { if (n === 1) requestMicStop(); else if (n === 3) { cancelMicLoop(false); stopTransport(); render(); speak('Mic loop cancelled. Stopped.'); } return; }
   if (n === 1) activate();
   else if (n === 3) togglePlay();
   else if (n >= 4) help();
@@ -1108,7 +1233,8 @@ function render() {
   $('tSample').className = S.tab === 'sample' ? 'on' : '';
   $('tSeq').className = S.tab === 'sequence' ? 'on' : '';
   const left = S.surface ? 'Play surface, bank ' + BANKS[S.surfaceBank] : S.tab === 'sample' ? 'Bank ' + BANKS[S.bank] : S.bpm + ' BPM, ' + S.bars + ' bars of ' + S.bpb;
-  const right = S.capturing ? '<span class="rec">● Recording pad</span>' : S.recording ? '<span class="rec">● Recording</span>' : S.playing ? '▶ Playing' : '■ Stopped';
+  const ml = S.micLoop ? (S.micLoop.stopAt ? 'stopping at bar line' : ctx.currentTime < S.micLoop.startAt ? 'starts at next bar' : 'recording') : '';
+  const right = S.micLoop ? '<span class="rec">● Mic loop, ' + ml + '</span>' : S.capturing ? '<span class="rec">● Recording pad</span>' : S.recording ? '<span class="rec">● Recording</span>' : S.playing ? '▶ Playing' : '■ Stopped';
   $('info').innerHTML = '<span>' + left + '</span><span>' + right + '</span>';
   const m = $('main');
   if (S.surface) {
