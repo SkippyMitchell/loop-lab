@@ -98,15 +98,14 @@ function unlock() {
 function resumeSoon() { unlock(); setTimeout(unlock, 300); }
 // iOS can leave an audio engine silent after the microphone or speech changes the
 // phone's audio setup. Rebuild a fresh engine; recorded sounds are kept.
-let rebuilding = false;
+let rebuilding = false, lastRebuild = 0;
 async function rebuildAudio(quiet) {
-  if (rebuilding) return; rebuilding = true;
+  if (rebuilding) return; rebuilding = true; lastRebuild = performance.now();
   const wasPlaying = S.playing;
   if (wasPlaying) stopTransport();
   try { await ctx.close(); } catch (e) {}
   initAudio();
   mic = null; proc = null;
-  if (micStream && micLive()) connectMic(); else if (micStream) await ensureMic(true);
   for (const k in liveChokes) delete liveChokes[k];
   previewVoice = null;
   unlock();
@@ -121,7 +120,7 @@ setInterval(() => {
   const t = ctx.currentTime;
   if (ctx.state === 'running' && t === wd.last) wd.stuck++; else { wd.stuck = 0; if (ctx.state !== 'running') unlock(); }
   wd.last = t;
-  if (wd.stuck >= 3) { wd.stuck = 0; rebuildAudio(true); }
+  if (wd.stuck >= 3 && performance.now() - lastRebuild > 20000) { wd.stuck = 0; rebuildAudio(true); }
 }, 1000);
 
 function tone(freq, dur = 0.06, vol = 0.15, when = 0, type = 'sine', dest) {
@@ -312,6 +311,14 @@ async function ensureMic(force) {
     return true;
   } catch (e) { mic = null; micStream = null; return false; }
 }
+// The mic is only open while you hold to record. Keeping it open all the time puts
+// iOS in a recording mode that chops up speech.
+function closeMic() {
+  if (mic) try { mic.disconnect(); } catch (e) {}
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  mic = null; micStream = null;
+}
+async function afterMic() { if (!S.playing) await rebuildAudio(true); else resumeSoon(); }
 function connectMic() {
   if (mic) try { mic.disconnect(); } catch (e) {}
   mic = ctx.createMediaStreamSource(micStream);
@@ -326,13 +333,13 @@ function connectMic() {
 async function startPadRecord() {
   if (cap.busy) return;
   const i = S.bank * 16 + S.focus;
-  if (!mic || !micLive()) {
-    const ok = await ensureMic(true);
-    if (!ok) { speak('Microphone is not available. Check that Safari is allowed to use the microphone, or load a sound from Files in the pad menu.'); return; }
-    if (!G.held && !spaceDown) { speak('Microphone reconnected. Hold again to record.'); return; }
-  }
-  unlock();
   hush();
+  cap.busy = true;
+  const ok = await ensureMic(true);
+  cap.busy = false;
+  if (!ok) { await afterMic(); speak('Microphone is not available. Check that Safari is allowed to use the microphone, or load a sound from Files in the pad menu.'); return; }
+  if (!G.held && !spaceDown) { closeMic(); await afterMic(); speak('Keep holding until you hear the beep.'); return; }
+  unlock();
   S.capturing = true; cap.pad = i; cap.chunks = []; cap.blobs = []; cap.rec = null;
   SND.rec();
   setTimeout(() => {
@@ -372,6 +379,9 @@ async function stopPadRecord() {
   clearTimeout(cap.timer);
   cap.on = false; S.capturing = false; cap.busy = true;
   await stopRecorder();
+  const tr = micStream && micStream.getAudioTracks()[0];
+  const st = !tr ? 'no microphone track' : tr.readyState !== 'live' ? 'microphone track ended' : tr.muted ? 'microphone muted by the system' : 'microphone on';
+  closeMic();
   const i = cap.pad;
   let sr = ctx.sampleRate, via = 'direct';
   let len = cap.chunks.reduce((a, c) => a + c.length, 0);
@@ -382,6 +392,7 @@ async function stopPadRecord() {
     const alt = await decodeBlobs();
     if (alt) { const p2 = peakOf(alt.raw, alt.raw.length); if (p2 > peak) { raw = alt.raw; sr = alt.sr; len = raw.length; peak = p2; via = 'recorder'; } }
   }
+  await afterMic();
   cap.busy = false;
   len = Math.max(0, len - Math.floor(0.05 * sr));             // drop finger-lift noise
   peak = peakOf(raw, len);
@@ -392,11 +403,8 @@ async function stopPadRecord() {
   }
   if (peak < 0.003) {
     SND.empty(); render();
-    const tr = micStream && micStream.getAudioTracks()[0];
-    const st = !tr ? 'no microphone track' : tr.readyState !== 'live' ? 'microphone track ended' : tr.muted ? 'microphone muted by the system' : 'microphone on';
     speak(padName(i) + ' unchanged. No sound was heard. Captured ' + (len / sr).toFixed(1) + ' seconds, loudest level ' +
-      (peak * 100).toFixed(2) + ' percent, ' + st + ', audio ' + ctx.state + '. Reconnecting the microphone, try again.');
-    ensureMic(true);
+      (peak * 100).toFixed(2) + ' percent, ' + st + '. Try again.');
     return;
   }
   const on = Math.max(0.002, peak * 0.08), off = Math.max(0.001, peak * 0.02);
@@ -998,14 +1006,15 @@ function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': 
 $('startBtn').addEventListener('click', async () => {
   initAudio(); unlock();
   speak('Starting Loop Lab.');
-  await ensureMic();
-  // Turning the microphone on changes the phone's audio setup, which can silence an
-  // engine made before it. Start a fresh engine now that the mic is on.
-  if (mic) await rebuildAudio(true);
+  // Ask for the microphone once so the permission prompt happens now, then close it
+  // and start a fresh sound engine in normal playback mode.
+  const micOK = await ensureMic();
+  closeMic();
+  await rebuildAudio(true);
   const n = await loadAll();
   $('start').remove(); started = true; render();
   speak('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
-    (mic ? '' : 'Microphone is not available, so use Load from Files or demo sounds in the pad menu. ') +
+    (micOK ? '' : 'Microphone is not available, so use Load from Files or demo sounds in the pad menu. ') +
     'Sample tab, bank ' + BANKS[S.bank] + '. ' + padDesc(S.bank * 16 + S.focus) + '. Four-finger tap for help.');
 });
 document.addEventListener('visibilitychange', () => { if (document.hidden && S.capturing) stopPadRecord(); });
