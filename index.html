@@ -25,6 +25,13 @@
   .pad.focus{border-color:#ffd23f}
   .pad.flash{background:#ffd23f !important;color:#000}
   .pad.recording{background:#b3261e !important}
+  .grid.stage{grid-template-rows:repeat(6,1fr);gap:6px}
+  .grid.kit{grid-template-rows:repeat(2,1fr)}
+  .grid.surf8{grid-template-columns:repeat(2,1fr);grid-template-rows:repeat(4,1fr)}
+  .pad.z0{background:#1d2440}.pad.z1{background:#2a1f3d}.pad.z2{background:#1f3326}
+  .pad.z0.full{background:#2c3f86;color:#dfe6ff}.pad.z1.full{background:#5a3a86;color:#f0e3ff}.pad.z2.full{background:#2e6b45;color:#dcffe8}
+  .pad.on{box-shadow:inset 0 0 0 4px #7dff9b}
+  .pad.active{box-shadow:inset 0 0 0 4px #9fb4ff}
   .list{flex:1;overflow:hidden;padding:6px 0}
   .item{padding:12px;border-radius:10px;margin-bottom:6px;background:#161a25;display:flex;justify-content:space-between;border:3px solid transparent}
   .item.focus{border-color:#ffd23f;background:#222a3d}
@@ -45,7 +52,7 @@
 </div>
 <div id="app" aria-hidden="true">
   <header>
-    <div id="tabs"><span id="tab-sample">Sample</span><span id="tab-sequence">Sequence</span><span id="tab-loop">Loop</span><span id="tab-settings">Settings</span></div>
+    <div id="tabs"><span id="tab-stage">Stage</span><span id="tab-settings">Settings</span></div>
     <div id="info"></div>
   </header>
   <main id="main"></main>
@@ -57,11 +64,11 @@
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
-const BANKS = 'ABCD';
+const ZONES = ['Kits', 'Patterns', 'Loops'];
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const round1 = v => Math.round(v * 10) / 10;
 const pct = v => Math.round(v * 100) + ' percent';
-const padName = i => BANKS[Math.floor(i / 16)] + ((i % 16) + 1);
+const padName = i => 'Kit ' + (Math.floor(i / 8) + 1) + ' pad ' + ((i % 8) + 1);
 const QUANTS = [
   {n: 'off', v: 0}, {n: 'quarter notes', v: 1}, {n: 'eighth notes', v: 0.5},
   {n: 'sixteenth notes', v: 0.25}, {n: 'thirty-second notes', v: 0.125}
@@ -69,14 +76,16 @@ const QUANTS = [
 
 // ---------------- state ----------------
 const S = {
-  tab: 'sample', bank: 0, focus: 0,
-  pads: Array(64).fill(null),          // {buf, vol, name}
+  tab: 'stage', focus: 0,                // focus: stage slot 0-23 (8 kits, 8 patterns, 8 loops)
+  kitEd: null, kitFocus: 0, activeKit: 0,
+  pads: Array(64).fill(null),          // 8 kits x 8 pads: {buf, vol, name, edits}
   clip: null, padUndo: null,
   menu: null,                           // {title, items, idx}
-  idx: {sequence: 0, loop: 0, settings: 0}, prevTab: 'sample', surface: false, surfaceBank: 0,
+  idx: {settings: 0}, surface: false, surfaceKit: 0,
   bpm: 100, bpb: 4, bars: 2, metro: true, metroVol: 0.6, countIn: 1, quant: 3,
-  events: [], takes: [], takeId: 0, curTake: 0,
-  tracks: [],                           // {buf, bars, vol, muted, src, g}
+  patterns: Array.from({length: 8}, () => ({events: [], takes: [], kit: 0, bars: 2, on: false, sw: 0})),
+  takeId: 0, curTake: 0, recPat: -1,
+  tracks: Array(8).fill(null),          // 8 loop slots: {buf, bars, vol, muted, src, g}
   playing: false, recording: false, capturing: false,
   rate: 1.1, confirm: null, confirmT: 0, taps: [], editStep: 1, audioMode: 'playback',
   voiceEngine: 'espeak', vPitch: 50, duck: true, esVoice: '', loopOffset: null, micLoop: null
@@ -374,28 +383,36 @@ function savePad(i) {
   DB.put('pad' + i, rec);
 }
 function saveTracks() {
-  DB.put('tracks', S.tracks.map(t => Object.assign(bufToRec(t.buf), {bars: t.bars, vol: t.vol, muted: t.muted, nudge: t.nudge || 0})));
+  DB.put('tracks', S.tracks.map(t => t ? Object.assign(bufToRec(t.buf), {bars: t.bars, vol: t.vol, muted: t.muted, nudge: t.nudge || 0}) : null));
 }
 let saveTimer = null;
 function saveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const k = ['bank','surfaceBank','bpm','bpb','bars','metro','metroVol','countIn','quant','events','takes','takeId','rate','editStep','audioMode','voiceEngine','vPitch','duck','esVoice','loopOffset'];
+    const k = ['activeKit','bpm','bpb','bars','metro','metroVol','countIn','quant','takeId','rate','editStep','audioMode','voiceEngine','vPitch','duck','esVoice','loopOffset'];
     const o = {}; k.forEach(x => o[x] = S[x]);
+    o.patterns = S.patterns.map(p => ({events: p.events.map(e => ({pad: e.pad, beat: e.beat, take: e.take})), takes: p.takes, kit: p.kit, bars: p.bars, on: p.on}));
     DB.put('state', o);
   }, 300);
 }
 async function loadAll() {
   if (!await DB.open()) return 0;
   const st = await DB.get('state');
-  if (st) { if (st.voiceEngine === undefined) st.audioMode = 'playback'; Object.assign(S, st); }
+  if (st) {
+    if (st.voiceEngine === undefined) st.audioMode = 'playback';
+    if (!st.patterns && st.events && st.events.length)        // older version: one pattern
+      st.patterns = [{events: st.events, takes: st.takes || [], kit: 0, bars: st.bars || 2, on: false}];
+    if (st.patterns) S.patterns = Array.from({length: 8}, (_, i) => Object.assign({events: [], takes: [], kit: 0, bars: S.bars, on: false}, st.patterns[i] || {}, {sw: 0}));
+    delete st.patterns; delete st.events; delete st.takes; delete st.tab;
+    Object.assign(S, st);
+  }
   let n = 0;
   for (let i = 0; i < 64; i++) {
     const r = await DB.get('pad' + i);
     if (r) { const p = newPad(recToBuf(r), r.name); PAD_KEYS.forEach(k => { if (r[k] !== undefined) p[k] = r[k]; }); S.pads[i] = p; n++; }
   }
   const tr = await DB.get('tracks');
-  if (tr) S.tracks = tr.map(r => ({buf: recToBuf(r), bars: r.bars, vol: r.vol, muted: r.muted, nudge: r.nudge || 0}));
+  if (tr) S.tracks = Array.from({length: 8}, (_, i) => { const r = tr[i]; return r ? {buf: recToBuf(r), bars: r.bars, vol: r.vol, muted: r.muted, nudge: r.nudge || 0} : null; });
   return n;
 }
 
@@ -445,9 +462,8 @@ function connectMic() {
   }
   mic.connect(proc);
 }
-async function startPadRecord() {
-  if (cap.busy) return;
-  const i = S.bank * 16 + S.focus;
+async function startPadRecord(i) {
+  if (cap.busy || i == null) return;
   hush();
   cap.busy = true;
   setSession('play-and-record');
@@ -578,13 +594,14 @@ function gen(kind, sr) {
   if (pk) for (let i = 0; i < len; i++) d[i] *= 0.8 / pk;
   return d;
 }
-function fillDemo() {
+function fillDemo(kit, set) {            // set 0: drums, set 1: percussion, bass and chord
   let n = 0;
-  for (let k = 0; k < 16; k++) {
-    const i = S.bank * 16 + k; if (S.pads[i]) continue;
-    const d = gen(DEMO[k][1], ctx.sampleRate);
+  for (let k = 0; k < 8; k++) {
+    const i = kit * 8 + k; if (S.pads[i]) continue;
+    const dm = DEMO[set * 8 + k];
+    const d = gen(dm[1], ctx.sampleRate);
     const b = ctx.createBuffer(1, d.length, ctx.sampleRate); b.copyToChannel(d, 0);
-    S.pads[i] = newPad(b, DEMO[k][0]); savePad(i); n++;
+    S.pads[i] = newPad(b, dm[0]); savePad(i); n++;
   }
   return n;
 }
@@ -607,27 +624,55 @@ $('fileIn').addEventListener('change', async e => {
   } catch (err) { speak('That file could not be loaded.'); }
 });
 
-// ---------------- sequencer ----------------
+// ---------------- sequencer: patterns and loop slots ----------------
 const T = {start: 0, sched: 0, timer: null};
 const spb = () => 60 / S.bpm;
 const loopBeats = () => S.bars * S.bpb;
+const patBeats = p => (p.bars || S.bars) * S.bpb;
 const wrap = (x, L) => ((x % L) + L) % L;
-function qBeat(b) {
+const allTracks = () => S.tracks.filter(Boolean);
+const kitCount = k => S.pads.slice(k * 8, k * 8 + 8).filter(Boolean).length;
+const plural = (n, w) => n + ' ' + w + (n === 1 ? '' : 's');
+function qBeat(b, L) {
   const q = QUANTS[S.quant].v; if (!q) return b;
-  const L = loopBeats(); let r = Math.round(b / q) * q;
+  const r = Math.round(b / q) * q;
   return r >= L ? r - L : r;
 }
 function click(t, accent, loud) {
   const v = (loud ? 0.5 : 0.35) * (loud ? Math.max(S.metroVol, 0.5) : S.metroVol);
   scheduled.push(Object.assign(tone(accent ? 1600 : 1000, 0.04, v, t, 'sine', master), {t}));
 }
+// Patterns and loops switch on or off at the next bar line while playing.
+function nextBarTime() {
+  if (!S.playing) return ctx.currentTime;
+  const bar = S.bpb * spb(), now = ctx.currentTime + 0.02;
+  if (now <= T.start) return T.start;
+  return T.start + Math.ceil((now - T.start) / bar) * bar;
+}
+const patActive = (p, t) => (t >= (p.sw || 0) ? p.on : !p.on);
+const pending = x => S.playing && (x.sw || 0) > ctx.currentTime;
+function setPatOn(p, on) {
+  if (p.on === on) return;
+  if (pending(p)) { p.on = on; p.sw = 0; return; }       // undo a switch that hasn't happened yet
+  p.on = on; p.sw = S.playing ? nextBarTime() : 0;
+}
+function setTrackOn(tr, on) {
+  if (tr.muted === !on) return;
+  if (pending(tr)) tr.sw = 0; else tr.sw = S.playing ? nextBarTime() : 0;
+  tr.muted = !on;
+  if (tr.g) {
+    const t = Math.max(ctx.currentTime, tr.sw || 0);
+    try { tr.g.gain.cancelScheduledValues(ctx.currentTime); tr.g.gain.setTargetAtTime(on ? tr.vol : 0, t, 0.005); } catch (e) {}
+  }
+}
 function startTransport(countBars) {
   const sp = spb(), now = ctx.currentTime + 0.08;
   const ci = countBars * S.bpb;
   for (let b = 0; b < ci; b++) click(now + b * sp, b % S.bpb === 0, true);
   T.start = now + ci * sp; T.sched = now;
+  S.patterns.forEach(p => p.sw = 0);
   S.playing = true;
-  S.tracks.forEach(startTrack);
+  allTracks().forEach(tr => { tr.sw = 0; startTrack(tr); });
   clearInterval(T.timer); T.timer = setInterval(schedule, 25); schedule();
 }
 function stopTransport() {
@@ -637,23 +682,29 @@ function stopTransport() {
   const now = ctx.currentTime;
   for (const s of scheduled) if (s.t > now) silence(s);
   scheduled.length = 0;
-  S.tracks.forEach(stopTrack);
+  S.patterns.forEach(p => p.sw = 0);
+  allTracks().forEach(tr => { tr.sw = 0; stopTrack(tr); });
 }
 function schedule() {
   const now = ctx.currentTime, to = now + 0.12, from = Math.max(T.sched, T.start);
   for (let k = scheduled.length - 1; k >= 0; k--) if (scheduled[k].t < now - 5) scheduled.splice(k, 1);
   if (to <= from) return;
-  const sp = spb(), L = loopBeats(), b0 = (from - T.start) / sp, b1 = (to - T.start) / sp;
+  const sp = spb(), b0 = (from - T.start) / sp, b1 = (to - T.start) / sp;
   if (S.metro) for (let b = Math.ceil(b0 - 1e-9); b < b1; b++) click(T.start + b * sp, b % S.bpb === 0, false);
   const qMax = QUANTS[S.quant].v * sp + 0.05;
-  for (let k = Math.floor(b0 / L); k <= Math.floor(b1 / L); k++) {
-    for (const ev of S.events) {
-      if (ev.beat >= L) continue;
-      const eb = qBeat(ev.beat) + k * L;
-      if (eb < b0 || eb >= b1) continue;
-      const t = T.start + eb * sp;
-      if (ev.born && t < ev.born + qMax) continue;   // just played live
-      playPad(ev.pad, t);
+  for (const p of S.patterns) {
+    if (!p.events.length || (!p.on && !pending(p))) continue;
+    const L = patBeats(p);
+    for (let k = Math.floor(b0 / L); k <= Math.floor(b1 / L); k++) {
+      for (const ev of p.events) {
+        if (ev.beat >= L) continue;
+        const eb = qBeat(ev.beat, L) + k * L;
+        if (eb < b0 || eb >= b1) continue;
+        const t = T.start + eb * sp;
+        if (!patActive(p, t)) continue;
+        if (ev.born && t < ev.born + qMax) continue;   // just played live
+        playPad(ev.pad, t);
+      }
     }
   }
   T.sched = to;
@@ -667,7 +718,7 @@ function startTrack(tr) {
   src.start(t, wrap(t - T.start, dur));
   tr.src = src; tr.g = g;
 }
-function stopTrack(tr) { if (tr.src) { try { tr.src.stop(); } catch (e) {} tr.src = null; } }
+function stopTrack(tr) { if (tr && tr.src) { try { tr.src.stop(); } catch (e) {} tr.src = null; } }
 function trackGain(tr) { if (tr.g) tr.g.gain.setTargetAtTime(tr.muted ? 0 : tr.vol, ctx.currentTime, 0.01); }
 
 function togglePlay() {
@@ -675,8 +726,9 @@ function togglePlay() {
   else { startTransport(0); speak('Playing.'); }
   render();
 }
+function ensurePlaying() { if (!S.playing) startTransport(0); }
 function setTempo(v) {
-  if (S.tracks.length) { speak('Tempo is locked while loop tracks exist.'); return false; }
+  if (allTracks().length) { speak('Tempo is locked while loops exist. Clear all loops in Settings to change it.'); return false; }
   v = clamp(Math.round(v), 40, 240);
   if (S.playing) { const pos = (ctx.currentTime - T.start) / spb(); S.bpm = v; T.start = ctx.currentTime - pos * spb(); }
   else S.bpm = v;
@@ -696,36 +748,48 @@ function tapTempo() {
     S.taps = [];
   }, 1300);
 }
-function startRecording() {
-  S.takeId++; S.curTake = S.takeId; S.recording = true;
+
+// ---- pattern recording ----
+function startPatternRecord(pi) {
+  const p = S.patterns[pi];
+  if (!p.events.length) { p.kit = S.activeKit; p.bars = S.bars; }
+  if (!kitCount(p.kit)) { speak('Kit ' + (p.kit + 1) + ' is empty. Record sounds into it first, or fill it with demo sounds from its menu.'); return; }
+  S.menu = null;
+  S.takeId++; S.curTake = S.takeId; S.recording = true; S.recPat = pi;
+  p.on = true; p.sw = 0;
   const wasPlaying = S.playing;
   if (!wasPlaying) startTransport(S.countIn);
-  enterSurface(true);
-  if (wasPlaying || !S.countIn) speak('Recording.');
+  enterSurface(p.kit, true);
+  if (wasPlaying || !S.countIn) speak('Recording pattern ' + (pi + 1) + '.');
 }
 function stopRecording(quiet) {
   S.recording = false;
-  const n = S.events.filter(e => e.take === S.curTake).length;
-  if (n) S.takes.push(S.curTake);
+  const p = S.patterns[S.recPat];
+  const n = p ? p.events.filter(e => e.take === S.curTake).length : 0;
+  if (n) p.takes.push(S.curTake);
   saveState();
-  if (!quiet) speak('Recording stopped. ' + n + (n === 1 ? ' hit' : ' hits') + ' recorded.');
+  if (!quiet) speak('Pattern ' + (S.recPat + 1) + ', ' + plural(n, 'hit') + ' recorded.');
 }
-function undoTake() {
-  if (!S.takes.length) { speak('Nothing to undo.'); return; }
-  const id = S.takes.pop(), before = S.events.length;
-  S.events = S.events.filter(e => e.take !== id);
-  speak('Removed last take, ' + (before - S.events.length) + ' hits.');
+function undoTake(pi) {
+  const p = S.patterns[pi];
+  if (!p.takes.length) { speak('Nothing to undo.'); return; }
+  const id = p.takes.pop(), before = p.events.length;
+  p.events = p.events.filter(e => e.take !== id);
+  speak('Removed last take, ' + plural(before - p.events.length, 'hit') + '.');
 }
-function clearPattern() { S.events = []; S.takes = []; speak('Pattern cleared.'); }
-async function bounce() {
-  const evs = S.events.filter(e => e.beat < loopBeats() && S.pads[e.pad]);
+function clearPattern(pi) { const p = S.patterns[pi]; p.events = []; p.takes = []; p.on = false; p.sw = 0; speak('Pattern ' + (pi + 1) + ' cleared.'); }
+async function bounce(pi) {
+  const p = S.patterns[pi], L = patBeats(p);
+  const evs = p.events.filter(e => e.beat < L && S.pads[e.pad]);
   if (!evs.length) { speak('The pattern is empty.'); return; }
-  if (S.tracks.length >= 8) { speak('All 8 loop tracks are full.'); return; }
+  const ti = S.tracks.findIndex(t => !t);
+  if (ti < 0) { speak('All 8 loop slots are full.'); return; }
+  S.menu = null; render();
   speak('Bouncing.');
-  const sr = ctx.sampleRate, sp = spb(), dur = loopBeats() * sp, n = Math.round(dur * sr);
+  const sr = ctx.sampleRate, sp = spb(), dur = L * sp, n = Math.round(dur * sr);
   const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   const oc = new OAC(2, n + Math.round(4 * sr), sr), chokes = {};
-  evs.map(ev => ({pad: ev.pad, t: qBeat(ev.beat) * sp})).sort((x, y) => x.t - y.t)
+  evs.map(ev => ({pad: ev.pad, t: qBeat(ev.beat, L) * sp})).sort((x, y) => x.t - y.t)
      .forEach(e => makeVoice(oc, oc.destination, e.pad, e.t, chokes));
   const r = await new Promise(res => { oc.oncomplete = e => res(e.renderedBuffer); const pr = oc.startRendering(); if (pr && pr.then) pr.then(res); });
   const out = ctx.createBuffer(2, n, sr);
@@ -733,34 +797,31 @@ async function bounce() {
     const d = out.getChannelData(c), s = r.getChannelData(c);
     for (let k = 0; k < s.length; k++) d[k % n] += s[k];
   }
-  const tr = {buf: out, bars: S.bars, vol: 1, muted: false};
-  S.tracks.push(tr); startTrack(tr);
-  S.events = []; S.takes = [];
+  const tr = {buf: out, bars: p.bars, vol: 1, muted: true, nudge: 0, sw: 0};
+  S.tracks[ti] = tr;
+  if (S.playing) { startTrack(tr); setTrackOn(tr, true); setPatOn(p, false); }   // swap over at the next bar
+  else { tr.muted = false; p.on = false; }
   saveTracks(); saveState(); SND.done(); render();
-  speak('Bounced to loop track ' + S.tracks.length + '. Pattern cleared, ready for the next layer.');
+  speak('Pattern ' + (pi + 1) + ' bounced to loop ' + (ti + 1) + '. The pattern is turned off and kept.');
 }
 
 // ---------------- mic loop recording ----------------
-// Records the mic into a loop track in time with the transport. Start and stop
+// Records the mic into a loop slot in time with the transport. Start and stop
 // both snap to bar lines; short takes leave silence, long takes wrap and layer.
 const LC = {on: false, chunks: []};
 function loopOffsetSec() {
   if (S.loopOffset != null) return S.loopOffset / 1000;
   return ctx ? Math.round(((ctx.outputLatency || 0) + (ctx.baseLatency || 0)) * 1000) / 1000 : 0;
 }
-function micLoopMenu() {
-  const items = [];
-  if (S.tracks.length < 8) items.push({l: () => 'New loop track', a: () => { startMicLoop({mode: 'new'}); return 'quiet'; }});
-  S.tracks.forEach((tr, ti) => {
-    items.push({l: () => 'Layer onto loop track ' + (ti + 1), a: () => { startMicLoop({mode: 'layer', ti}); return 'quiet'; }});
-    items.push({l: () => 'Replace loop track ' + (ti + 1), a: () => { startMicLoop({mode: 'replace', ti}); return 'quiet'; }});
-  });
-  items.push({l: () => 'Cancel', a: () => { back(); return 'quiet'; }});
-  return {title: 'Record mic loop', idx: 0, items};
+function loopRecMenu(ti) {
+  return {title: 'Record into loop ' + (ti + 1), idx: 0, items: [
+    {l: () => 'Layer on top', a: () => { startMicLoop({mode: 'layer', ti}); return 'quiet'; }, h: 'Adds your new recording on top of this loop.'},
+    {l: () => 'Replace', a: () => { startMicLoop({mode: 'replace', ti}); return 'quiet'; }, h: 'Records a new loop in place of this one.'},
+    {l: () => 'Cancel', a: () => { back(); return 'quiet'; }}
+  ]};
 }
 async function startMicLoop(target) {
   if (S.micLoop || S.capturing || cap.busy) return;
-  if (target.mode === 'new' && S.tracks.length >= 8) { speak('All 8 loop tracks are full.'); return; }
   S.menu = null; render();
   speak('Get ready.');
   await sleep(700); hush();
@@ -799,8 +860,7 @@ async function finishMicLoop() {
   const chunks = LC.chunks; LC.chunks = [];
   const sr = ctx.sampleRate, off = loopOffsetSec(), t0 = m.startAt, t1 = m.stopAt || m.maxAt;
   const tg = m.target, old = tg.mode === 'new' ? null : S.tracks[tg.ti];
-  // the take, lined up to musical time
-  const take = new Float32Array(Math.ceil((t1 - t0) * sr));
+  const take = new Float32Array(Math.ceil((t1 - t0) * sr));          // the take, lined up to musical time
   for (const c of chunks) {
     const first = Math.round((c.t - off - t0) * sr);
     for (let k = 0; k < c.d.length; k++) { const idx = first + k; if (idx >= 0 && idx < take.length) take[idx] = c.d[k]; }
@@ -822,13 +882,13 @@ async function finishMicLoop() {
     if (tg.mode === 'layer' && old) { const src = old.buf.getChannelData(Math.min(c, old.buf.numberOfChannels - 1)); d.set(src.subarray(0, n)); }
     for (let k = 0; k < take.length; k++) d[(at + k) % n] += take[k];
   }
-  let tr, num;
-  if (!old) { tr = {buf: nb, bars: S.bars, vol: 1, muted: false, nudge: 0}; S.tracks.push(tr); num = S.tracks.length; }
-  else { tr = old; tr.prevBuf = tr.buf; tr.buf = nb; if (tg.mode === 'replace') { tr.bars = S.bars; tr.nudge = 0; } num = tg.ti + 1; }
+  let tr;
+  if (!old) { tr = {buf: nb, bars: S.bars, vol: 1, muted: false, nudge: 0, sw: 0}; S.tracks[tg.ti] = tr; }
+  else { tr = old; tr.prevBuf = tr.buf; tr.buf = nb; tr.muted = false; if (tg.mode === 'replace') { tr.bars = S.bars; tr.nudge = 0; } }
   if (S.playing) startTrack(tr);
   saveTracks(); await afterMic(); SND.done(); render();
   const bars = Math.round((t1 - t0) / (S.bpb * spb()));
-  speak((tg.mode === 'layer' ? 'Layered onto' : tg.mode === 'replace' ? 'Replaced' : 'Recorded into') + ' loop track ' + num + ', ' + bars + (bars === 1 ? ' bar' : ' bars') + ' recorded.');
+  speak((tg.mode === 'layer' ? 'Layered onto' : tg.mode === 'replace' ? 'Replaced' : 'Recorded into') + ' loop ' + (tg.ti + 1) + ', ' + plural(bars, 'bar') + ' recorded.');
 }
 function nudgeTrack(tr, ms) {
   const sr = tr.buf.sampleRate, n = tr.buf.length, k = ((Math.round(ms / 1000 * sr) % n) + n) % n;
@@ -840,45 +900,50 @@ function nudgeTrack(tr, ms) {
   tr.buf = nb; tr.nudge = (tr.nudge || 0) + ms; startTrack(tr); saveTracks();
 }
 
-// ---------------- play surface ----------------
+// ---------------- play surface: one kit's 8 pads, 4 rows of 2 ----------------
 const SG = {active: new Set(), group: [], groupT: 0, cmd: false};
-function enterSurface(rec) {
-  S.surface = true; S.menu = null; SG.active.clear(); SG.cmd = false;
+function enterSurface(kit, rec) {
+  S.surface = true; S.surfaceKit = kit; S.menu = null; SG.active.clear(); SG.cmd = false;
   SND.open(); render();
-  if (!rec) speak('Play surface, bank ' + BANKS[S.surfaceBank] + '. Three-finger tap to leave.');
+  if (!rec) speak('Play surface, kit ' + (kit + 1) + '. Two columns of four pads. Three-finger tap to leave.');
 }
 function exitSurface() {
   S.surface = false; SND.close();
-  if (S.recording) stopRecording(false); else speak('Controls. ' + curItemText());
+  if (S.recording) stopRecording(false); else speak(focusDesc());
   render();
+}
+function surfPad(x, y) {
+  const r = $('gl').getBoundingClientRect();
+  const col = clamp(Math.floor((x - r.left) / r.width * 2), 0, 1);
+  const row = clamp(Math.floor((y - r.top) / r.height * 4), 0, 3);
+  return row * 2 + col;
 }
 function surfStart(e) {
   unlock();
-  const now = performance.now(), r = $('gl').getBoundingClientRect();
+  const now = performance.now();
   for (const t of e.changedTouches) {
     SG.active.add(t.identifier);
     if (now - SG.groupT > 90) { SG.group = []; SG.groupT = now; }
-    const col = clamp(Math.floor((t.clientX - r.left) / r.width * 4), 0, 3);
-    const row = clamp(Math.floor((t.clientY - r.top) / r.height * 4), 0, 3);
-    const pad = S.surfaceBank * 16 + row * 4 + col;
+    const k = surfPad(t.clientX, t.clientY), pad = S.surfaceKit * 8 + k;
     const hit = {v: null, ev: null};
     if (S.pads[pad]) {
       hit.v = playPad(pad);
-      if (S.recording) {
-        const lat = (ctx.outputLatency || 0) + (ctx.baseLatency || 0);
-        const now2 = ctx.currentTime;
-        hit.ev = {pad, beat: wrap((now2 - lat - T.start) / spb(), loopBeats()), take: S.curTake, born: now2};
-        S.events.push(hit.ev);
+      const p = S.patterns[S.recPat];
+      if (S.recording && p) {
+        const lat = (ctx.outputLatency || 0) + (ctx.baseLatency || 0), now2 = ctx.currentTime;
+        hit.ev = {pad, beat: wrap((now2 - lat - T.start) / spb(), patBeats(p)), take: S.curTake, born: now2};
+        p.events.push(hit.ev);
       }
     } else SND.empty();
     SG.group.push(hit);
-    flash(row * 4 + col);
+    flash(k);
   }
   if (SG.group.length >= 3 && !SG.cmd) {       // three fingers = leave, erase those stray hits
     SG.cmd = true;
+    const p = S.patterns[S.recPat];
     for (const h of SG.group) {
       silence(h.v);
-      if (h.ev) S.events = S.events.filter(x => x !== h.ev);
+      if (h.ev && p) p.events = p.events.filter(x => x !== h.ev);
     }
   }
 }
@@ -891,7 +956,7 @@ function flash(k) {
   el.classList.add('flash'); setTimeout(() => el.classList.remove('flash'), 110);
 }
 
-// ---------------- menus & lists ----------------
+// ---------------- descriptions ----------------
 function itemText(it) { if (!it) return ''; const v = it.v ? it.v() : ''; return it.l() + (v ? ', ' + v : ''); }
 function confirmThen(key, fn) {
   return () => {
@@ -901,14 +966,44 @@ function confirmThen(key, fn) {
   };
 }
 function padDesc(i) {
-  const p = S.pads[i];
-  if (!p) return padName(i) + ', empty';
-  return padName(i) + ', ' + (p.name || 'recorded') + ', ' + padLen(p).toFixed(2) + ' seconds' + (isEdited(p) ? ', edited' : '') + (p.vol !== 1 ? ', volume ' + pct(p.vol) : '');
+  const p = S.pads[i], n = 'Pad ' + ((i % 8) + 1);
+  if (!p) return n + ', empty';
+  return n + ', ' + (p.name || 'recorded') + ', ' + padLen(p).toFixed(2) + ' seconds' + (isEdited(p) ? ', edited' : '') + (p.vol !== 1 ? ', volume ' + pct(p.vol) : '');
 }
+const zoneOf = slot => Math.floor(slot / 8);
+function slotDesc(slot) {
+  const z = zoneOf(slot), n = slot % 8;
+  if (z === 0) {
+    const c = kitCount(n);
+    return 'Kit ' + (n + 1) + ', ' + (c ? c + ' of 8 sounds' : 'empty') + (S.activeKit === n ? ', active' : '');
+  }
+  if (z === 1) {
+    const p = S.patterns[n];
+    if (!p.events.length) return 'Pattern ' + (n + 1) + ', empty';
+    return 'Pattern ' + (n + 1) + ', ' + (pending(p) ? (p.on ? 'turning on' : 'turning off') : p.on ? 'on' : 'off') + ', ' +
+      plural(p.events.length, 'hit') + ', kit ' + (p.kit + 1) + ', ' + plural(p.bars, 'bar');
+  }
+  const tr = S.tracks[n];
+  if (!tr) return 'Loop ' + (n + 1) + ', empty';
+  return 'Loop ' + (n + 1) + ', ' + (pending(tr) ? (tr.muted ? 'turning off' : 'turning on') : tr.muted ? 'off' : 'on') + ', ' +
+    plural(tr.bars, 'bar') + (tr.vol !== 1 ? ', volume ' + pct(tr.vol) : '');
+}
+function focusDesc() {
+  if (S.menu) return S.menu.title + '. ' + itemText(S.menu.items[S.menu.idx]);
+  if (S.tab === 'settings') return 'Settings. ' + curItemText();
+  if (S.kitEd != null) return 'Kit ' + (S.kitEd + 1) + ' editor. ' + padDesc(S.kitEd * 8 + S.kitFocus);
+  return slotDesc(S.focus);
+}
+const ZONE_TONES = [() => tone(1046, 0.04, 0.08, 0, 'sine'), () => tone(784, 0.05, 0.09, 0, 'triangle'), () => tone(523, 0.05, 0.05, 0, 'square')];
+function zoneTone(slot) { ZONE_TONES[zoneOf(slot)](); }
+
+// ---------------- menus ----------------
 const STEPS = [{n: 'fine, 5 milliseconds', v: 0.005}, {n: 'medium, 20 milliseconds', v: 0.02}, {n: 'coarse, 100 milliseconds', v: 0.1}];
 const secs = v => v.toFixed(3).replace(/0+$/, '').replace(/\.$/, '') + ' seconds';
 function signed(v, unit) { return v === 0 ? 'none' : (v > 0 ? 'plus ' : 'minus ') + Math.abs(v) + ' ' + unit; }
 function panText(v) { return Math.abs(v) < 0.05 ? 'center' : Math.round(Math.abs(v) * 100) + ' percent ' + (v < 0 ? 'left' : 'right'); }
+function openSub(m) { S.menu = Object.assign(m, {parent: S.menu}); SND.open(); render(); speak(m.title + '. ' + itemText(m.items[0]) + ', 1 of ' + m.items.length); }
+function openMenuObj(m) { S.menu = m; SND.open(); render(); speak(m.title + '. ' + itemText(m.items[0]) + ', 1 of ' + m.items.length); }
 function editMenu(i) {
   const P = () => S.pads[i], step = () => STEPS[S.editStep].v;
   const ed = fn => d => { const p = P(); if (!p) return; fn(p, d); savePad(i); };
@@ -916,7 +1011,7 @@ function editMenu(i) {
     {l: () => 'Preview', a: () => { preview(i); return 'quiet'; }, h: 'Plays the sound with all edits.'},
     {l: () => 'Start', v: () => secs(P().start) + ', length ' + padLen(P()).toFixed(2),
       adj: ed((p, d) => { p.start = clamp(+(p.start + d * step()).toFixed(3), 0, padEnd(p) - 0.01); preview(i, {head: true}); }),
-      h: 'Trims the beginning. Swipe right to cut more. You hear the first part of the sound after each change.'},
+      h: 'Trims the beginning. Swipe right to cut more. You hear the first part of the sound after each change. Edit step in Settings sets how far each swipe moves.'},
     {l: () => 'End', v: () => secs(padEnd(P())) + ', length ' + padLen(P()).toFixed(2),
       adj: ed((p, d) => { const e = clamp(+(padEnd(p) + d * step()).toFixed(3), p.start + 0.01, p.buf.duration); p.end = e >= p.buf.duration ? null : e; preview(i, {tail: true}); }),
       h: 'Trims the ending. Swipe left to cut more. You hear the last part of the sound after each change.'},
@@ -938,12 +1033,11 @@ function editMenu(i) {
   ]};
 }
 function padMenu(i) {
-  const items = [
+  return {title: padName(i) + ' menu', idx: 0, items: [
     {l: () => 'Play', a: () => { if (!playPad(i)) speak('Empty.'); return 'quiet'; }},
     {l: () => 'Edit sound', v: () => S.pads[i] && isEdited(S.pads[i]) ? 'edited' : '', a: () => {
       if (!S.pads[i]) { speak('Pad is empty. Record something first.'); return 'quiet'; }
-      S.menu = Object.assign(editMenu(i), {parent: S.menu}); SND.open(); render();
-      speak(S.menu.title + '. ' + itemText(S.menu.items[0]) + ', 1 of ' + S.menu.items.length); return 'quiet'; },
+      openSub(editMenu(i)); return 'quiet'; },
       h: 'Trim, pitch, reverse, fades, pan, volume and play mode. Edits never change your original recording.'},
     {l: () => 'Load sound from Files', a: () => { filePad = i; $('fileIn').click(); return 'quiet'; }, h: 'Opens the Files picker. VoiceOver may be needed to use the picker.'},
     {l: () => 'Copy', a: () => { if (!S.pads[i]) { speak('Pad is empty.'); return 'quiet'; } S.clip = Object.assign({}, S.pads[i]); speak('Copied.'); return 'quiet'; }},
@@ -954,84 +1048,77 @@ function padMenu(i) {
       if (!S.padUndo || S.padUndo.i !== i) { speak('Nothing to restore.'); return 'quiet'; }
       S.pads[i] = S.padUndo.prev; S.padUndo = null; savePad(i); speak('Restored.'); return 'quiet'; }},
     {l: () => 'Clear pad', a: confirmThen('clear' + i, () => { S.padUndo = {i, prev: S.pads[i]}; S.pads[i] = null; savePad(i); speak('Cleared.'); })},
-    {l: () => 'Fill empty pads in bank ' + BANKS[S.bank] + ' with demo sounds', a: () => { const n = fillDemo(); speak(n ? 'Added ' + n + ' demo sounds.' : 'No empty pads in this bank.'); return 'quiet'; },
-      h: 'Puts a synthesized drum kit, bass notes and a chord into any empty pads in this bank.'},
+    {l: () => 'Close menu', a: () => { back(); return 'quiet'; }}
+  ]};
+}
+function kitMenu(k) {
+  return {title: 'Kit ' + (k + 1) + ' menu', idx: 0, items: [
+    {l: () => 'Open kit editor', a: () => { openKitEditor(k); return 'quiet'; },
+      h: 'Shows this kit\'s 8 pads in two rows of four, to play, record, edit, copy or clear each sound.'},
+    {l: () => S.activeKit === k ? 'Active kit' : 'Make active kit', a: () => { S.activeKit = k; speak('Kit ' + (k + 1) + ' is now active.'); return 'quiet'; },
+      h: 'New patterns use the active kit.'},
+    {l: () => 'Fill empty pads with demo drums', a: () => { const n = fillDemo(k, 0); speak(n ? 'Added ' + plural(n, 'demo sound') + '.' : 'No empty pads in this kit.'); return 'quiet'; },
+      h: 'Kick, snare, closed hat, open hat, clap, rim, low tom and high tom.'},
+    {l: () => 'Fill empty pads with demo bass and chords', a: () => { const n = fillDemo(k, 1); speak(n ? 'Added ' + plural(n, 'demo sound') + '.' : 'No empty pads in this kit.'); return 'quiet'; },
+      h: 'Cowbell, shaker, four bass notes, a chord stab and a blip.'},
+    {l: () => 'Clear kit', v: () => kitCount(k) + ' of 8 sounds', a: confirmThen('clearKit' + k, () => {
+      for (let j = 0; j < 8; j++) { S.pads[k * 8 + j] = null; savePad(k * 8 + j); } speak('Kit ' + (k + 1) + ' cleared.'); })},
+    {l: () => 'Close menu', a: () => { back(); return 'quiet'; }}
+  ]};
+}
+function patternMenu(pi) {
+  const p = S.patterns[pi], has = () => p.events.length > 0;
+  const items = [
+    {l: () => p.on ? 'Turn off' : 'Turn on', a: () => { if (!has()) { speak('Pattern is empty.'); return 'quiet'; } togglePattern(pi); return 'quiet'; }},
+    {l: () => has() ? 'Record more' : 'Record', a: () => { startPatternRecord(pi); return 'quiet'; },
+      h: 'Opens the play surface for this pattern\'s kit and records your hits. Each pass layers on top. Three-finger tap stops.'},
+    {l: () => 'Play surface', a: () => { enterSurface(p.kit, false); return 'quiet'; }, h: 'Jam on this pattern\'s kit without recording.'},
+    {l: () => 'Kit', v: () => 'kit ' + (p.kit + 1), adj: d => { p.kit = clamp(p.kit + d, 0, 7); },
+      h: 'Which kit this pattern\'s play surface uses. Hits already recorded keep their own sounds.'},
+    {l: () => 'Length', v: () => plural(p.bars, 'bar'), adj: d => { const o = [1, 2, 4, 8, 16]; p.bars = o[clamp(o.indexOf(p.bars) + d, 0, 4)]; },
+      h: 'Each pattern can have its own length. New patterns start at the Loop length setting.'},
+    {l: () => 'Undo last take', v: () => p.takes.length ? plural(p.takes.length, 'take') : 'nothing to undo', a: () => { undoTake(pi); return 'quiet'; }},
+    {l: () => 'Bounce to a loop', a: () => { bounce(pi); return 'quiet'; },
+      h: 'Turns this pattern into audio in the next empty loop slot, then turns the pattern off. The pattern is kept.'},
+    {l: () => 'Clear pattern', v: () => plural(p.events.length, 'hit'), a: confirmThen('clearPat' + pi, () => clearPattern(pi))},
     {l: () => 'Close menu', a: () => { back(); return 'quiet'; }}
   ];
-  return {title: 'Pad ' + padName(i) + ' menu', items, idx: 0};
+  return {title: 'Pattern ' + (pi + 1) + ' menu', idx: 0, items};
 }
-function trackMenu(ti) {
+function loopMenu(ti) {
   const tr = S.tracks[ti];
-  return {title: 'Loop track ' + (ti + 1) + ' menu', idx: 0, items: [
-    {l: () => tr.muted ? 'Unmute' : 'Mute', a: () => { tr.muted = !tr.muted; trackGain(tr); saveTracks(); speak(tr.muted ? 'Muted.' : 'Unmuted.'); return 'quiet'; }},
+  if (!tr) return {title: 'Loop ' + (ti + 1) + ' menu', idx: 0, items: [
+    {l: () => 'Record mic loop', a: () => { startMicLoop({mode: 'new', ti}); return 'quiet'; },
+      h: 'Records your voice or instrument into this loop slot. Tap anywhere to stop at the next bar line.'},
+    {l: () => 'Close menu', a: () => { back(); return 'quiet'; }}
+  ]};
+  return {title: 'Loop ' + (ti + 1) + ' menu', idx: 0, items: [
+    {l: () => tr.muted ? 'Turn on' : 'Turn off', a: () => { toggleLoop(ti); return 'quiet'; }},
     {l: () => 'Volume', v: () => pct(tr.vol), adj: d => { tr.vol = clamp(round1(tr.vol + d * 0.1), 0, 1.5); trackGain(tr); saveTracks(); }},
     {l: () => 'Layer a mic recording', a: () => { startMicLoop({mode: 'layer', ti}); return 'quiet'; },
-      h: 'Records the microphone on top of this track. Tap to stop at the next bar line.'},
+      h: 'Records the microphone on top of this loop. Tap to stop at the next bar line.'},
     {l: () => 'Replace with a mic recording', a: () => { startMicLoop({mode: 'replace', ti}); return 'quiet'; }},
     {l: () => 'Undo last layer', v: () => tr.prevBuf ? 'available' : 'nothing to undo', a: () => {
       if (!tr.prevBuf) { speak('Nothing to undo.'); return 'quiet'; }
       tr.buf = tr.prevBuf; tr.prevBuf = null; startTrack(tr); saveTracks(); speak('Last layer removed.'); return 'quiet'; }},
     {l: () => 'Nudge timing', v: () => (tr.nudge || 0) + ' milliseconds', adj: d => nudgeTrack(tr, d * 5),
-      h: 'Shifts the whole track earlier or later by 5 milliseconds per swipe. Swipe left if it sounds late, right if it sounds early.'},
-    {l: () => 'Delete track', a: confirmThen('del' + ti, () => {
-      stopTrack(tr); S.tracks.splice(ti, 1); saveTracks(); S.menu = null;
-      speak('Track deleted. ' + curItemText()); })},
+      h: 'Shifts the whole loop earlier or later by 5 milliseconds per swipe. Swipe left if it sounds late, right if it sounds early.'},
+    {l: () => 'Delete loop', a: confirmThen('del' + ti, () => {
+      stopTrack(tr); S.tracks[ti] = null; saveTracks(); S.menu = null; render();
+      speak('Loop ' + (ti + 1) + ' deleted.'); })},
     {l: () => 'Close menu', a: () => { back(); return 'quiet'; }}
   ]};
-}
-const TAB_NAMES = {sample: 'Sample', sequence: 'Sequence', loop: 'Loop', settings: 'Settings'};
-const TABS = ['sample', 'sequence', 'loop', 'settings'];
-const playItem = () => ({l: () => S.playing ? 'Stop' : 'Play', v: () => S.playing ? 'playing' : 'stopped', a: () => { togglePlay(); return 'quiet'; },
-  h: 'Starts or stops the loop. Three-finger tap does this from anywhere.'});
-const bounceItem = () => ({l: () => 'Bounce pattern to loop track', v: () => S.events.length + (S.events.length === 1 ? ' hit' : ' hits'), a: () => { bounce(); return 'quiet'; },
-  h: 'Turns the pattern into an audio loop track, then clears the pattern so you can record the next layer. Up to 8 tracks. Tempo locks while tracks exist.'});
-function seqItems() {
-  return [
-    playItem(),
-    {l: () => 'Record', a: () => { startRecording(); return 'quiet'; },
-      h: 'Records pad hits into the pattern and opens the play surface. When stopped, you hear the count-in first. Each pass layers on top. Three-finger tap on the surface stops recording.'},
-    {l: () => 'Play surface', a: () => { enterSurface(false); return 'quiet'; }, h: 'Opens the 16 pads as a 4 by 4 playing grid, top left is pad 1, without recording.'},
-    {l: () => 'Surface bank', v: () => BANKS[S.surfaceBank], adj: d => { S.surfaceBank = clamp(S.surfaceBank + d, 0, 3); }},
-    {l: () => 'Undo last take', v: () => S.takes.length ? S.takes.length + (S.takes.length === 1 ? ' take' : ' takes') : 'nothing to undo', a: () => { undoTake(); return 'quiet'; }},
-    {l: () => 'Clear pattern', v: () => S.events.length + (S.events.length === 1 ? ' hit' : ' hits'), a: confirmThen('clearPat', clearPattern)},
-    bounceItem()
-  ];
-}
-function loopItems() {
-  const it = [
-    playItem(),
-    {l: () => 'Record mic loop', a: () => {
-      if (!S.tracks.length) { startMicLoop({mode: 'new'}); return 'quiet'; }
-      S.menu = micLoopMenu(); SND.open(); render();
-      speak(S.menu.title + '. ' + itemText(S.menu.items[0]) + ', 1 of ' + S.menu.items.length); return 'quiet'; },
-      h: 'Records your voice or instrument into a loop track, in time. Recording starts at the next bar line, after the count-in if stopped. Tap anywhere to stop at the next bar line. Two-finger swipe down cancels. Headphones keep the speaker out of the recording.'},
-    bounceItem(),
-    {l: () => S.tracks.length && !S.tracks.some(t => !t.muted) ? 'Unmute all' : 'Mute all',
-      v: () => S.tracks.length ? S.tracks.filter(t => t.muted).length + ' of ' + S.tracks.length + ' muted' : 'no loop tracks',
-      a: () => { if (!S.tracks.length) { speak('No loop tracks.'); return 'quiet'; }
-        const m = S.tracks.some(t => !t.muted); S.tracks.forEach(t => { t.muted = m; trackGain(t); }); saveTracks();
-        speak(m ? 'All loops muted.' : 'All loops unmuted.'); return 'quiet'; }},
-    {l: () => 'Clear all loops', v: () => S.tracks.length + (S.tracks.length === 1 ? ' track' : ' tracks'),
-      a: confirmThen('clearLoops', () => { S.tracks.forEach(stopTrack); S.tracks = []; saveTracks(); speak('All loops cleared. Tempo unlocked.'); }),
-      h: 'Deletes every loop track. Tap twice to confirm. Clearing them unlocks the tempo.'}
-  ];
-  S.tracks.forEach((tr, ti) => it.push({
-    l: () => 'Loop track ' + (ti + 1), v: () => tr.bars + (tr.bars === 1 ? ' bar' : ' bars') + ', ' + (tr.muted ? 'muted' : 'on') + ', volume ' + pct(tr.vol),
-    a: () => { tr.muted = !tr.muted; trackGain(tr); saveTracks(); }, adj: d => { tr.vol = clamp(round1(tr.vol + d * 0.1), 0, 1.5); trackGain(tr); saveTracks(); },
-    menu: () => trackMenu(ti), h: 'Tap to mute or unmute. Swipe left or right for volume. Two-finger tap for more: layer, replace, undo layer, nudge timing and delete.'
-  }));
-  return it;
 }
 function settingsItems() {
   return [
     {l: () => 'Tempo', v: () => S.bpm + ' BPM', adj: d => { setTempo(S.bpm + d); }, a: () => { tapTempo(); return 'quiet'; },
-      h: 'Swipe right or left to change by 1. Or tap 3 or more times in time to set it by tapping. Locked while loop tracks exist.'},
+      h: 'Swipe right or left to change by 1. Or tap 3 or more times in time to set it by tapping. Locked while loops exist.'},
     {l: () => 'Beats per bar', v: () => String(S.bpb), adj: d => { S.bpb = clamp(S.bpb + d, 2, 7); }},
-    {l: () => 'Loop length', v: () => S.bars + (S.bars === 1 ? ' bar' : ' bars'), adj: d => { const o = [1, 2, 4, 8, 16]; S.bars = o[clamp(o.indexOf(S.bars) + d, 0, 4)]; },
-      h: 'Length of the pattern, and of new mic loops.'},
+    {l: () => 'Loop length', v: () => plural(S.bars, 'bar'), adj: d => { const o = [1, 2, 4, 8, 16]; S.bars = o[clamp(o.indexOf(S.bars) + d, 0, 4)]; },
+      h: 'Length of new patterns and new mic loops.'},
     {l: () => 'Metronome', v: () => S.metro ? 'on' : 'off', a: () => { S.metro = !S.metro; }, adj: () => { S.metro = !S.metro; }},
     {l: () => 'Metronome volume', v: () => pct(S.metroVol), adj: d => { S.metroVol = clamp(round1(S.metroVol + d * 0.1), 0, 1); }},
-    {l: () => 'Count-in', v: () => S.countIn ? S.countIn + (S.countIn === 1 ? ' bar' : ' bars') : 'off', adj: d => { S.countIn = clamp(S.countIn + d, 0, 2); }},
+    {l: () => 'Count-in', v: () => S.countIn ? plural(S.countIn, 'bar') : 'off', adj: d => { S.countIn = clamp(S.countIn + d, 0, 2); }},
     {l: () => 'Quantize', v: () => QUANTS[S.quant].n, adj: d => { S.quant = clamp(S.quant + d, 0, QUANTS.length - 1); },
       h: 'Snaps pattern hits to the beat grid when they play back. Your original timing is kept, so you can change this any time.'},
     {l: () => 'Edit step', v: () => STEPS[S.editStep].n, adj: d => { S.editStep = clamp(S.editStep + d, 0, 2); },
@@ -1049,33 +1136,126 @@ function settingsItems() {
     {l: () => 'Speech rate', v: () => Math.round(S.rate * 100) + ' percent', adj: d => { S.rate = clamp(round1(S.rate + d * 0.1), 0.5, 2); },
       h: 'Three-finger swipe up or down also changes this from anywhere.'},
     {l: () => 'Lower sounds while speaking', v: () => S.duck ? 'on' : 'off', a: () => { S.duck = !S.duck; }, adj: () => { S.duck = !S.duck; },
-      h: 'Turns the loop and pads down while eSpeak talks, so you can hear it over the music.'},
+      h: 'Turns the music down while eSpeak talks, so you can hear it.'},
     {l: () => 'Audio mode', v: () => AUDIO_MODES[S.audioMode],
       adj: d => { const k = Object.keys(AUDIO_MODES); S.audioMode = k[clamp(k.indexOf(S.audioMode) + d, 0, k.length - 1)]; setSession(S.audioMode); },
       h: 'Changes how iOS handles Loop Lab audio. Mix with speech is muted by the ring silent switch.'},
+    {l: () => 'Clear all loops', v: () => plural(allTracks().length, 'loop'),
+      a: confirmThen('clearLoops', () => { allTracks().forEach(stopTrack); S.tracks = Array(8).fill(null); saveTracks(); speak('All loops cleared. Tempo unlocked.'); }),
+      h: 'Deletes every loop. Tap twice to confirm. This unlocks the tempo.'},
     {l: () => 'Restart audio', a: () => { rebuildAudio(false); return 'quiet'; },
       h: 'Use this if sounds stop. It restarts the sound engine and keeps all your recordings.'}
   ];
 }
-function tabItems(tab) { return tab === 'sequence' ? seqItems() : tab === 'loop' ? loopItems() : tab === 'settings' ? settingsItems() : null; }
 function curList() {
   if (S.menu) return {items: S.menu.items, get: () => S.menu.idx, set: v => S.menu.idx = v};
-  const items = tabItems(S.tab); if (!items) return null;
-  const t = S.tab;
-  S.idx[t] = clamp(S.idx[t] || 0, 0, items.length - 1);
-  return {items, get: () => S.idx[t], set: v => S.idx[t] = v};
+  if (S.tab !== 'settings') return null;
+  const items = settingsItems();
+  S.idx.settings = clamp(S.idx.settings || 0, 0, items.length - 1);
+  return {items, get: () => S.idx.settings, set: v => S.idx.settings = v};
 }
 function curItemText() { const L = curList(); return L ? itemText(L.items[L.get()]) : ''; }
+const inList = () => !!S.menu || S.tab === 'settings';
 
-// ---------------- actions ----------------
-function gridMove(dir) {
+// ---------------- stage actions ----------------
+function togglePattern(pi) {
+  const p = S.patterns[pi];
+  const on = !p.on;
+  setPatOn(p, on);
+  if (on) ensurePlaying();
+  SND.act(); saveState(); render();
+  speak('Pattern ' + (pi + 1) + (on ? ' on' : ' off') + (pending(p) ? ' at the next bar.' : '.'));
+}
+function toggleLoop(ti) {
+  const tr = S.tracks[ti];
+  const on = tr.muted;
+  setTrackOn(tr, on);
+  if (on && !S.playing) ensurePlaying();
+  SND.act(); saveTracks(); render();
+  speak('Loop ' + (ti + 1) + (on ? ' on' : ' off') + (pending(tr) ? ' at the next bar.' : '.'));
+}
+function stageTap(slot) {
+  S.focus = slot; zoneTone(slot);
+  const z = zoneOf(slot), n = slot % 8;
+  if (z === 0) {
+    if (!kitCount(n)) { render(); speak('Kit ' + (n + 1) + ', empty. Touch and hold to record a sound into it. Two-finger tap for its menu.'); return; }
+    S.activeKit = n; saveState(); render();
+    const first = S.pads.slice(n * 8, n * 8 + 8).findIndex(Boolean);
+    if (first >= 0) playPad(n * 8 + first);
+    speak('Kit ' + (n + 1) + ' active, ' + kitCount(n) + ' of 8 sounds.');
+  } else if (z === 1) {
+    if (!S.patterns[n].events.length) { render(); speak('Pattern ' + (n + 1) + ', empty. Touch and hold to record it with kit ' + (S.activeKit + 1) + '.'); return; }
+    togglePattern(n);
+  } else {
+    if (!S.tracks[n]) { render(); speak('Loop ' + (n + 1) + ', empty. Touch and hold to record a mic loop.'); return; }
+    toggleLoop(n);
+  }
+}
+function stageHold(slot) {
+  S.focus = slot; render();
+  const z = zoneOf(slot), n = slot % 8;
+  if (z === 0) {
+    const free = S.pads.slice(n * 8, n * 8 + 8).findIndex(x => !x);
+    if (free < 0) { speak('Kit ' + (n + 1) + ' is full. Two-finger tap, then open the kit editor to re-record a pad.'); return; }
+    startPadRecord(n * 8 + free);
+  } else if (z === 1) startPatternRecord(n);
+  else if (!S.tracks[n]) startMicLoop({mode: 'new', ti: n});
+  else openMenuObj(loopRecMenu(n));
+}
+function stageMenu(slot) {
+  S.focus = slot; zoneTone(slot);
+  const z = zoneOf(slot), n = slot % 8;
+  openMenuObj(z === 0 ? kitMenu(n) : z === 1 ? patternMenu(n) : loopMenu(n));
+}
+function stageMove(dir) {
   const r = Math.floor(S.focus / 4), c = S.focus % 4;
   let nr = r, nc = c;
   if (dir === 'up') nr--; if (dir === 'down') nr++; if (dir === 'left') nc--; if (dir === 'right') nc++;
-  if (nr < 0 || nr > 3 || nc < 0 || nc > 3) { SND.edge(); return; }
-  S.focus = nr * 4 + nc; SND.tick(); render();
-  speak(padDesc(S.bank * 16 + S.focus));
+  if (nr < 0 || nr > 5 || nc < 0 || nc > 3) { SND.edge(); return; }
+  const crossed = zoneOf(nr * 4 + nc) !== zoneOf(S.focus);
+  S.focus = nr * 4 + nc; zoneTone(S.focus); render();
+  speak((crossed ? ZONES[zoneOf(S.focus)] + '. ' : '') + slotDesc(S.focus));
 }
+// position -> slot. Stage: 6 rows of 4 over the main area. Kit editor: 2 rows of 4.
+function slotAt(x, y) {
+  const r = $('main').getBoundingClientRect();
+  const col = clamp(Math.floor((x - r.left) / r.width * 4), 0, 3);
+  const row = clamp(Math.floor((y - r.top) / r.height * 6), 0, 5);
+  return row * 4 + col;
+}
+function kitPadAt(x, y) {
+  const r = $('main').getBoundingClientRect();
+  const col = clamp(Math.floor((x - r.left) / r.width * 4), 0, 3);
+  const row = clamp(Math.floor((y - r.top) / r.height * 2), 0, 1);
+  return row * 4 + col;
+}
+
+// ---- kit editor ----
+function openKitEditor(k) {
+  S.menu = null; S.kitEd = k; S.kitFocus = 0; SND.open(); render();
+  speak('Kit ' + (k + 1) + ' editor, two rows of four pads. ' + padDesc(k * 8) + '. Two-finger swipe down to go back.');
+}
+function closeKitEditor() {
+  const k = S.kitEd; S.kitEd = null; S.focus = k; SND.close(); render(); speak('Stage. ' + slotDesc(S.focus));
+}
+function kitTap(j) {
+  S.kitFocus = j; const i = S.kitEd * 8 + j; render();
+  if (!playPad(i)) { SND.empty(); speak(padDesc(i) + '. Touch and hold to record.'); }
+}
+function kitMove(dir) {
+  const r = Math.floor(S.kitFocus / 4), c = S.kitFocus % 4;
+  let nr = r, nc = c;
+  if (dir === 'up') nr--; if (dir === 'down') nr++; if (dir === 'left') nc--; if (dir === 'right') nc++;
+  if (nr < 0 || nr > 1 || nc < 0 || nc > 3) { SND.edge(); return; }
+  S.kitFocus = nr * 4 + nc; SND.tick(); render(); speak(padDesc(S.kitEd * 8 + S.kitFocus));
+}
+function changeKit(d) {
+  const n = S.kitEd + d; if (n < 0 || n > 7) { SND.edge(); return; }
+  S.kitEd = n; SND.bank(); render();
+  speak('Kit ' + (n + 1) + ', ' + kitCount(n) + ' of 8 sounds. ' + padDesc(n * 8 + S.kitFocus));
+}
+
+// ---- lists ----
 function listMove(dir) {
   const L = curList(); if (!L) return;
   const it = L.items[L.get()];
@@ -1089,61 +1269,35 @@ function listMove(dir) {
     speak(it.v ? it.v() : it.l());
   }
 }
-function activate() {
-  if (S.tab === 'sample' && !S.menu) {
-    const i = S.bank * 16 + S.focus;
-    if (!playPad(i)) { SND.empty(); speak(padName(i) + ', empty. Touch and hold to record.'); }
-    return;
-  }
+function listActivate() {
   const L = curList(), it = L.items[L.get()];
   if (!it.a) { SND.edge(); speak(itemText(it)); return; }
-  if (it !== undefined && it.l() !== 'Tempo') SND.act();
+  if (it.l() !== 'Tempo') SND.act();
   const res = it.a();
   saveState(); render();
-  if (res !== 'quiet') speak(itemText(curList().items[curList().get()]));
-}
-function openMenu() {
-  if (S.micLoop) return;
-  if (S.menu) { activate(); return; }
-  if (S.tab === 'sample') { S.menu = padMenu(S.bank * 16 + S.focus); }
-  else { const L = curList(), it = L.items[L.get()]; if (it.menu) S.menu = it.menu(); else { activate(); return; } }
-  SND.open(); render();
-  speak(S.menu.title + '. ' + itemText(S.menu.items[0]) + ', 1 of ' + S.menu.items.length);
+  const L2 = curList();
+  if (res !== 'quiet' && L2) speak(itemText(L2.items[L2.get()]));
 }
 function back() {
-  if (S.menu && S.menu.parent) {
-    S.menu = S.menu.parent; SND.close(); render();
-    speak(S.menu.title + '. ' + itemText(S.menu.items[S.menu.idx]));
-  } else if (S.menu) {
-    S.menu = null; SND.close(); render();
-    speak(S.tab === 'sample' ? padDesc(S.bank * 16 + S.focus) : curItemText());
-  } else SND.edge();
-}
-function changeBank(d) {
-  const n = S.bank + d; if (n < 0 || n > 3) { SND.edge(); return; }
-  S.bank = n; SND.bank(); saveState(); render();
-  const full = S.pads.slice(n * 16, n * 16 + 16).filter(Boolean).length;
-  speak('Bank ' + BANKS[n] + ', ' + full + ' of 16 recorded. ' + padDesc(n * 16 + S.focus));
-}
-function switchTab(d) {
-  const n = TABS.indexOf(S.tab) + d;
-  if (n < 0 || n >= TABS.length) { SND.edge(); return; }
-  goTab(TABS[n]);
+  if (S.menu && S.menu.parent) { S.menu = S.menu.parent; SND.close(); render(); speak(focusDesc()); }
+  else if (S.menu) { S.menu = null; SND.close(); render(); speak(focusDesc()); }
+  else if (S.kitEd != null) closeKitEditor();
+  else SND.edge();
 }
 function goTab(tab) {
-  if (S.tab !== tab && tab === 'settings') S.prevTab = S.tab;
-  S.tab = tab; S.menu = null; SND.bank(); render();
-  if (S.tab === 'sample') speak('Sample tab, bank ' + BANKS[S.bank] + '. ' + padDesc(S.bank * 16 + S.focus));
-  else speak(TAB_NAMES[S.tab] + ' tab. ' + curItemText());
+  S.tab = tab; S.menu = null; S.kitEd = null; SND.bank(); render();
+  speak(tab === 'settings' ? 'Settings. ' + curItemText() : 'Stage. ' + slotDesc(S.focus));
 }
-// Four-finger double tap: open Settings, or go back to where you were.
-function toggleSettings() { goTab(S.tab === 'settings' ? (S.prevTab && S.prevTab !== 'settings' ? S.prevTab : 'sample') : 'settings'); }
+function switchTab(d) { const n = (S.tab === 'stage' ? 0 : 1) + d; if (n < 0 || n > 1) { SND.edge(); return; } goTab(n ? 'settings' : 'stage'); }
+function toggleSettings() { goTab(S.tab === 'settings' ? 'stage' : 'settings'); }
 function whereAmI() {
-  const loop = S.playing ? 'Loop playing.' : 'Loop stopped.';
-  if (S.menu) speak(S.menu.title + '. ' + itemText(S.menu.items[S.menu.idx]) + ', ' + (S.menu.idx + 1) + ' of ' + S.menu.items.length + '. ' + loop);
-  else if (S.tab === 'sample') { const full = S.pads.slice(S.bank * 16, S.bank * 16 + 16).filter(Boolean).length;
-    speak('Sample tab, bank ' + BANKS[S.bank] + ', ' + full + ' of 16 recorded. ' + loop); }
-  else speak(TAB_NAMES[S.tab] + ' tab. ' + S.bpm + ' BPM, ' + S.bars + ' bars of ' + S.bpb + '. ' + loop + ' Pattern has ' + S.events.length + ' hits, ' + S.tracks.length + ' loop tracks.');
+  const play = S.playing ? 'Playing.' : 'Stopped.';
+  const pOn = S.patterns.filter(p => p.on && p.events.length).length, lOn = allTracks().filter(t => !t.muted).length;
+  const sum = play + ' ' + plural(pOn, 'pattern') + ' on, ' + plural(lOn, 'loop') + ' on. ' + S.bpm + ' BPM.';
+  if (S.menu) speak(S.menu.title + '. ' + itemText(S.menu.items[S.menu.idx]) + ', ' + (S.menu.idx + 1) + ' of ' + S.menu.items.length + '. ' + play);
+  else if (S.tab === 'settings') speak('Settings. ' + curItemText() + '. ' + play);
+  else if (S.kitEd != null) speak('Kit ' + (S.kitEd + 1) + ' editor, ' + kitCount(S.kitEd) + ' of 8 sounds. ' + play);
+  else speak('Stage. ' + sum + ' Active kit ' + (S.activeKit + 1) + '.');
 }
 function toggleVoice() {
   hush();
@@ -1155,28 +1309,40 @@ function toggleVoice() {
 function rateChange(d) { S.rate = clamp(round1(S.rate + d * 0.1), 0.5, 2); saveState(); speak('Speech rate ' + Math.round(S.rate * 100) + ' percent'); }
 function help() {
   let t;
-  if (S.menu) t = 'Menu. Swipe up or down to move. Swipe left or right to change a value. Tap to choose. Touch and hold to hear a description. Two-finger swipe down closes the menu.';
-  else if (S.tab === 'sample') t = 'Sample tab. Swipe in any direction to move between the 16 pads. Tap plays the focused pad. Touch and hold to record: wait for the beep, make your sound, then lift. Two-finger tap opens the pad menu. Two-finger swipe left or right changes bank.';
-  else t = TAB_NAMES[S.tab] + ' tab. Swipe up or down to move through controls. Swipe left or right to change a value. Tap to activate. Touch and hold to hear a description.' +
-    (S.tab === 'loop' ? ' Two-finger tap on a loop track opens its menu.' : '');
+  if (S.menu || S.tab === 'settings') t = (S.menu ? 'Menu' : 'Settings') + '. Swipe up or down to move. Swipe left or right to change a value. Tap to choose. Touch and hold to hear a description.' + (S.menu ? ' Two-finger swipe down closes the menu.' : '');
+  else if (S.kitEd != null) t = 'Kit editor. Two rows of four pads. Tap a pad to play it, or swipe to move. Touch and hold a pad to record into it: wait for the beep, make your sound, then lift. Two-finger tap opens the pad menu, with edit, load from Files, copy, paste and clear. Two-finger swipe left or right changes kit. Two-finger swipe down goes back to the stage.';
+  else t = 'Stage. Six rows of four. Top two rows: 8 kits. Middle two rows: 8 patterns. Bottom two rows: 8 loops. Tap a slot to use it: a kit becomes active, a pattern or loop turns on or off at the next bar. Touch and drag to explore and hear each slot. Swipe to move between slots. Touch and hold to record: into a kit\'s next empty pad, a pattern using the active kit, or a mic loop. Two-finger tap opens a slot\'s menu.';
   t += ' While recording a mic loop: tap anywhere to stop at the next bar line, two-finger swipe down cancels.';
-  t += ' Everywhere: three-finger tap plays or stops the loop. Three-finger swipe left or right changes tab. Three-finger swipe up or down changes speech rate. Two-finger swipe up says where you are. Two-finger double tap stops speech. Four-finger double tap opens Settings, and again returns. Four-finger tap is help.';
+  t += ' Everywhere: three-finger tap plays or stops. Three-finger swipe left or right switches between Stage and Settings. Three-finger swipe up or down changes speech rate. Two-finger swipe up says where you are. Two-finger double tap stops speech. Four-finger double tap opens Settings, and again returns. Four-finger tap is help.';
   speak(t);
 }
 
 // ---------------- gestures ----------------
-const G = {pts: new Map(), all: [], max: 0, t0: 0, hold: null, held: false, lastTap2: 0, tap2Timer: null, lastTap4: 0, tap4Timer: null};
+const G = {pts: new Map(), all: [], max: 0, t0: 0, hold: null, held: false, lastTap2: 0, tap2Timer: null, lastTap4: 0, tap4Timer: null,
+  exploring: false, moved: 0, last: -1};
+const posMode = () => !inList() && !S.micLoop;          // stage or kit editor: touch position matters
+function slotUnder(x, y) { return S.kitEd != null ? kitPadAt(x, y) : slotAt(x, y); }
 function holdFire() {
   G.held = true;
   if (S.micLoop) return;
-  if (S.tab === 'sample' && !S.menu) startPadRecord();
-  else { const L = curList(); const it = L && L.items[L.get()]; if (it) speak(it.h || itemText(it)); }
+  if (inList()) { const L = curList(); const it = L && L.items[L.get()]; if (it) speak(it.h || itemText(it)); return; }
+  const p = G.all[0]; if (!p) return;
+  if (S.kitEd != null) { const j = kitPadAt(p.x0, p.y0); S.kitFocus = j; render(); startPadRecord(S.kitEd * 8 + j); }
+  else stageHold(slotAt(p.x0, p.y0));
 }
 function holdEnd() { if (S.capturing) stopPadRecord(); }
+function explore(x, y) {
+  const s = slotUnder(x, y); if (s === G.last) return;
+  G.last = s;
+  if (S.kitEd != null) { S.kitFocus = s; SND.tick(); render(); speak(padDesc(S.kitEd * 8 + s)); }
+  else { S.focus = s; zoneTone(s); render(); speak(slotDesc(s)); }
+}
 function classify() {
   const dur = performance.now() - G.t0, n = G.max;
-  let dx = 0, dy = 0; for (const p of G.all) { dx += p.x - p.x0; dy += p.y - p.y0; }
-  dx /= G.all.length; dy /= G.all.length;
+  if (G.exploring) return;                               // explore leaves focus where you lifted
+  let dx = 0, dy = 0, cx = 0, cy = 0;
+  for (const p of G.all) { dx += p.x - p.x0; dy += p.y - p.y0; cx += p.x0; cy += p.y0; }
+  dx /= G.all.length; dy /= G.all.length; cx /= G.all.length; cy /= G.all.length;
   const d = Math.hypot(dx, dy);
   if (d > 40 && dur < 900) {
     const dir = Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? 'right' : 'left') : (dy > 0 ? 'down' : 'up');
@@ -1185,38 +1351,52 @@ function classify() {
     if (n === 2) {
       const now = performance.now();
       if (now - G.lastTap2 < 350) { clearTimeout(G.tap2Timer); G.lastTap2 = 0; hush(); }
-      else { G.lastTap2 = now; G.tap2Timer = setTimeout(() => openMenu(), 300); }
+      else { G.lastTap2 = now; G.tap2Timer = setTimeout(() => openMenu(cx, cy), 300); }
     } else if (n >= 4 && !S.micLoop) {
       const now = performance.now();
       if (now - G.lastTap4 < 400) { clearTimeout(G.tap4Timer); G.lastTap4 = 0; toggleSettings(); }
       else { G.lastTap4 = now; G.tap4Timer = setTimeout(() => help(), 350); }
-    } else onTap(n);
+    } else onTap(n, G.all[0].x0, G.all[0].y0);
   }
+}
+function openMenu(x, y) {
+  if (S.micLoop) return;
+  if (inList()) { if (S.menu) listActivate(); return; }
+  if (S.kitEd != null) {
+    const j = x == null ? S.kitFocus : kitPadAt(x, y); S.kitFocus = j;
+    openMenuObj(padMenu(S.kitEd * 8 + j)); return;
+  }
+  stageMenu(x == null ? S.focus : slotAt(x, y));
 }
 function onSwipe(n, dir) {
   if (S.micLoop) { if (n === 2 && dir === 'down') cancelMicLoop(true); return; }
-  if (n === 1) { if (S.tab === 'sample' && !S.menu) gridMove(dir); else listMove(dir); }
+  if (n === 1) { if (inList()) listMove(dir); else if (S.kitEd != null) kitMove(dir); else stageMove(dir); }
   else if (n === 2) {
     if (dir === 'down') back();
     else if (dir === 'up') whereAmI();
-    else if (S.tab === 'sample' && !S.menu) changeBank(dir === 'right' ? 1 : -1);
+    else if (S.kitEd != null && !S.menu) changeKit(dir === 'right' ? 1 : -1);
     else SND.edge();
   } else if (n === 3) {
     if (dir === 'left' || dir === 'right') switchTab(dir === 'right' ? 1 : -1);
     else rateChange(dir === 'up' ? 1 : -1);
   }
 }
-function onTap(n) {
+function onTap(n, x, y) {
   if (S.micLoop) { if (n === 1) requestMicStop(); else if (n === 3) { cancelMicLoop(false); stopTransport(); render(); speak('Mic loop cancelled. Stopped.'); } return; }
-  if (n === 1) activate();
-  else if (n === 3) togglePlay();
-  else if (n >= 4) help();
+  if (n === 1) {
+    if (inList()) listActivate();
+    else if (S.kitEd != null) kitTap(x == null ? S.kitFocus : kitPadAt(x, y));
+    else stageTap(x == null ? S.focus : slotAt(x, y));
+  } else if (n === 3) togglePlay();
 }
 const gl = $('gl');
 gl.addEventListener('touchstart', e => {
   e.preventDefault(); if (!started) return; unlock();
   if (S.surface) { surfStart(e); return; }
-  if (G.pts.size === 0) { G.all = []; G.max = 0; G.held = false; G.t0 = performance.now(); clearTimeout(G.hold); G.hold = setTimeout(holdFire, 450); }
+  if (G.pts.size === 0) {
+    G.all = []; G.max = 0; G.held = false; G.exploring = false; G.moved = 0; G.last = -1;
+    G.t0 = performance.now(); clearTimeout(G.hold); G.hold = setTimeout(holdFire, 450);
+  }
   for (const t of e.changedTouches) { const p = {x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY}; G.pts.set(t.identifier, p); G.all.push(p); }
   G.max = Math.max(G.max, G.pts.size);
   if (G.max > 1) clearTimeout(G.hold);
@@ -1226,7 +1406,14 @@ gl.addEventListener('touchmove', e => {
   for (const t of e.changedTouches) {
     const p = G.pts.get(t.identifier); if (!p) continue;
     p.x = t.clientX; p.y = t.clientY;
-    if (!G.held && Math.hypot(p.x - p.x0, p.y - p.y0) > 15) clearTimeout(G.hold);
+    const dist = Math.hypot(p.x - p.x0, p.y - p.y0);
+    if (!G.held && dist > 15) {
+      clearTimeout(G.hold);
+      if (!G.moved) G.moved = performance.now();
+      // a slow start, or a long drag, means exploring rather than swiping
+      if (G.max === 1 && posMode() && !G.exploring && (G.moved - G.t0 > 250 || performance.now() - G.t0 > 700)) G.exploring = true;
+    }
+    if (G.exploring) explore(p.x, p.y);
   }
 }, {passive: false});
 function tEnd(e) {
@@ -1241,26 +1428,33 @@ function tEnd(e) {
 gl.addEventListener('touchend', e => { unlock(); tEnd(e); }, {passive: false});
 gl.addEventListener('touchcancel', tEnd, {passive: false});
 
-// keyboard (for testing on a laptop)
-const SURF_KEYS = '1234qwerasdfzxcv';
+// keyboard (for testing on a laptop): arrows move, Enter taps the focused slot,
+// hold Space to record, M menu, Escape back, P play, O settings, H help, W where am I.
+const SURF_KEYS = '12qwaszx';
 let spaceDown = false;
 document.addEventListener('keydown', e => {
   if (!started || e.repeat && e.key !== ' ') return;
   unlock();
   if (S.surface) {
     const k = SURF_KEYS.indexOf(e.key.toLowerCase());
-    if (k >= 0) { const fake = {changedTouches: [{identifier: 'k' + k, clientX: (k % 4 + 0.5) * innerWidth / 4, clientY: (Math.floor(k / 4) + 0.5) * innerHeight / 4}]}; surfStart(fake); SG.active.delete('k' + k); }
+    if (k >= 0) { const r = $('gl').getBoundingClientRect();
+      const fake = {changedTouches: [{identifier: 'k' + k, clientX: r.left + (k % 2 + 0.5) * r.width / 2, clientY: r.top + (Math.floor(k / 2) + 0.5) * r.height / 4}]};
+      surfStart(fake); SG.active.delete('k' + k); }
     if (e.key === 'Escape') exitSurface();
     e.preventDefault(); return;
   }
   const arrows = {ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right'};
   if (arrows[e.key]) { e.shiftKey ? onSwipe(3, arrows[e.key]) : onSwipe(1, arrows[e.key]); }
   else if (e.key === 'Enter') onTap(1);
-  else if (e.key === ' ') { if (!spaceDown) { spaceDown = true; holdFire(); } }
+  else if (e.key === ' ') {
+    if (!spaceDown) { spaceDown = true; G.held = true;
+      if (S.micLoop) {} else if (inList()) holdFire();
+      else if (S.kitEd != null) startPadRecord(S.kitEd * 8 + S.kitFocus); else stageHold(S.focus); }
+  }
   else if (e.key === 'Escape') back();
   else if (e.key === 'm') openMenu();
   else if (e.key === '[' || e.key === ']') onSwipe(2, e.key === ']' ? 'right' : 'left');
-  else if (e.key === 'p') togglePlay();
+  else if (e.key === 'p') onTap(3);
   else if (e.key === 'h') help();
   else if (e.key === 'o') toggleSettings();
   else if (e.key === 'w') whereAmI();
@@ -1271,29 +1465,43 @@ document.addEventListener('keyup', e => { if (e.key === ' ' && spaceDown) { spac
 
 // ---------------- rendering (visual, for sighted collaborators) ----------------
 function render() {
-  TABS.forEach(t => $('tab-' + t).className = S.tab === t ? 'on' : '');
-  const left = S.surface ? 'Play surface, bank ' + BANKS[S.surfaceBank] : S.tab === 'sample' ? 'Bank ' + BANKS[S.bank] : S.bpm + ' BPM, ' + S.bars + ' bars of ' + S.bpb;
+  $('tab-stage').className = S.tab === 'stage' ? 'on' : '';
+  $('tab-settings').className = S.tab === 'settings' ? 'on' : '';
+  const left = S.surface ? 'Play surface, kit ' + (S.surfaceKit + 1) : S.kitEd != null ? 'Kit ' + (S.kitEd + 1) + ' editor' : S.bpm + ' BPM, ' + S.bars + ' bars of ' + S.bpb;
   const ml = S.micLoop ? (S.micLoop.stopAt ? 'stopping at bar line' : ctx.currentTime < S.micLoop.startAt ? 'starts at next bar' : 'recording') : '';
   const right = S.micLoop ? '<span class="rec">● Mic loop, ' + ml + '</span>' : S.capturing ? '<span class="rec">● Recording pad</span>' : S.recording ? '<span class="rec">● Recording</span>' : S.playing ? '▶ Playing' : '■ Stopped';
   $('info').innerHTML = '<span>' + left + '</span><span>' + right + '</span>';
   const m = $('main');
   if (S.surface) {
-    let h = '<div class="grid">';
-    for (let k = 0; k < 16; k++) { const i = S.surfaceBank * 16 + k, p = S.pads[i];
-      h += '<div class="pad' + (p ? ' full' : '') + '" data-k="' + k + '"><b>' + padName(i) + '</b>' + (p ? esc(p.name || 'rec') : '') + '</div>'; }
+    let h = '<div class="grid surf8">';
+    for (let k = 0; k < 8; k++) { const i = S.surfaceKit * 8 + k, p = S.pads[i];
+      h += '<div class="pad' + (p ? ' full' : '') + '" data-k="' + k + '"><b>Pad ' + (k + 1) + '</b>' + (p ? esc(p.name || 'rec') : '') + '</div>'; }
     m.innerHTML = h + '</div>';
-  } else if (S.menu || S.tab !== 'sample') {
+  } else if (inList()) {
     const L = curList(); const idx = L.get();
     const start = Math.max(0, Math.min(idx - 4, L.items.length - 10));
     let h = '<div class="list">' + (S.menu ? '<h2>' + esc(S.menu.title) + '</h2>' : '');
     L.items.slice(start, start + 10).forEach((it, j) => {
       h += '<div class="item' + (start + j === idx ? ' focus' : '') + '"><span>' + esc(it.l()) + '</span><span>' + esc(it.v ? it.v() : '') + '</span></div>'; });
     m.innerHTML = h + '</div>';
+  } else if (S.kitEd != null) {
+    let h = '<div class="grid kit">';
+    for (let k = 0; k < 8; k++) { const i = S.kitEd * 8 + k, p = S.pads[i];
+      h += '<div class="pad z0' + (p ? ' full' : '') + (k === S.kitFocus ? ' focus' : '') + (S.capturing && cap.pad === i ? ' recording' : '') + '"><b>Pad ' + (k + 1) + '</b>' +
+        (p ? esc(p.name || 'rec') + ' ' + padLen(p).toFixed(1) + 's' : 'empty') + '</div>'; }
+    m.innerHTML = h + '</div>';
   } else {
-    let h = '<div class="grid">';
-    for (let k = 0; k < 16; k++) { const i = S.bank * 16 + k, p = S.pads[i];
-      h += '<div class="pad' + (p ? ' full' : '') + (k === S.focus ? ' focus' : '') + (S.capturing && cap.pad === i ? ' recording' : '') + '"><b>' + padName(i) + '</b>' +
-        (p ? esc(p.name || 'rec') + ' ' + p.buf.duration.toFixed(1) + 's' : 'empty') + '</div>'; }
+    let h = '<div class="grid stage">';
+    for (let s = 0; s < 24; s++) {
+      const z = zoneOf(s), n = s % 8;
+      let full, on = false, label, sub;
+      if (z === 0) { const c = kitCount(n); full = c > 0; label = 'Kit ' + (n + 1); sub = c + '/8'; }
+      else if (z === 1) { const p = S.patterns[n]; full = p.events.length > 0; on = full && p.on; label = 'Pattern ' + (n + 1); sub = full ? 'kit ' + (p.kit + 1) + (on ? ' · on' : ' · off') : 'empty'; }
+      else { const tr = S.tracks[n]; full = !!tr; on = full && !tr.muted; label = 'Loop ' + (n + 1); sub = full ? (on ? 'on' : 'off') : 'empty'; }
+      const rec = S.capturing && z === 0 && Math.floor(cap.pad / 8) === n;
+      h += '<div class="pad z' + z + (full ? ' full' : '') + (on ? ' on' : '') + (z === 0 && S.activeKit === n ? ' active' : '') +
+        (s === S.focus ? ' focus' : '') + (rec ? ' recording' : '') + '"><b>' + label + '</b>' + sub + '</div>';
+    }
     m.innerHTML = h + '</div>';
   }
 }
@@ -1315,8 +1523,8 @@ $('startBtn').addEventListener('click', async () => {
   await waitForVoice(4000);
   $('start').remove(); started = true; render();
   speak('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
-    (micOK ? '' : 'Microphone is not available, so use Load from Files or demo sounds in the pad menu. ') +
-    'Sample tab, bank ' + BANKS[S.bank] + '. ' + padDesc(S.bank * 16 + S.focus) + '. Four-finger tap for help.');
+    (micOK ? '' : 'Microphone is not available, so use Load from Files or demo sounds in a kit menu. ') +
+    'Stage. Kits on top, patterns in the middle, loops at the bottom. ' + slotDesc(S.focus) + '. Four-finger tap for help.');
 });
 document.addEventListener('visibilitychange', () => { if (document.hidden && S.capturing) stopPadRecord(); });
 </script>
