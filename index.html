@@ -89,7 +89,6 @@ function initAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'interactive'});
   master = ctx.createGain(); master.connect(ctx.destination);
   uiBus = ctx.createGain(); uiBus.gain.value = 0.9; uiBus.connect(ctx.destination);
-  try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
 }
 function unlock() { if (ctx && ctx.state !== 'running') ctx.resume(); }
 
@@ -267,54 +266,110 @@ async function loadAll() {
 }
 
 // ---------------- microphone + pad recording ----------------
-let mic = null;
-const cap = {on: false, chunks: [], timer: null, pad: -1};
-async function ensureMic() {
-  if (mic) return true;
+// Two capture paths run together: raw samples from the Web Audio graph, and a
+// MediaRecorder copy. If iOS feeds the graph silence, the MediaRecorder copy is used.
+let mic = null, micStream = null, proc = null;
+const cap = {on: false, chunks: [], timer: null, pad: -1, rec: null, blobs: [], busy: false};
+const micLive = () => micStream && micStream.getAudioTracks().some(t => t.readyState === 'live' && t.enabled);
+async function ensureMic(force) {
+  if (mic && micLive() && !force) return true;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false}});
-    mic = ctx.createMediaStreamSource(stream);
-    const proc = ctx.createScriptProcessor(2048, 1, 1);
-    proc.onaudioprocess = e => { if (cap.on) cap.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
-    const z = ctx.createGain(); z.gain.value = 0;
-    mic.connect(proc); proc.connect(z); z.connect(ctx.destination);
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    micStream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false}});
+    if (mic) try { mic.disconnect(); } catch (e) {}
+    mic = ctx.createMediaStreamSource(micStream);
+    if (!proc) {
+      proc = ctx.createScriptProcessor(2048, 1, 1);
+      proc.onaudioprocess = e => { if (cap.on) cap.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+      const z = ctx.createGain(); z.gain.value = 0;
+      proc.connect(z); z.connect(ctx.destination);
+    }
+    mic.connect(proc);
     return true;
-  } catch (e) { mic = null; return false; }
+  } catch (e) { mic = null; micStream = null; return false; }
 }
-function startPadRecord() {
+async function startPadRecord() {
+  if (cap.busy) return;
   const i = S.bank * 16 + S.focus;
-  if (!mic) {
-    speak('Microphone is not available. You can load a sound from Files in the pad menu instead.');
-    ensureMic();
-    return;
+  if (!mic || !micLive()) {
+    const ok = await ensureMic(true);
+    if (!ok) { speak('Microphone is not available. Check that Safari is allowed to use the microphone, or load a sound from Files in the pad menu.'); return; }
+    if (!G.held && !spaceDown) { speak('Microphone reconnected. Hold again to record.'); return; }
   }
+  unlock();
   hush();
-  S.capturing = true; cap.pad = i; cap.chunks = [];
+  S.capturing = true; cap.pad = i; cap.chunks = []; cap.blobs = []; cap.rec = null;
   SND.rec();
-  setTimeout(() => { if (S.capturing) { cap.chunks = []; cap.on = true; } }, 150);
+  setTimeout(() => {
+    if (!S.capturing) return;
+    cap.chunks = []; cap.on = true;
+    if (window.MediaRecorder) {
+      try {
+        const mr = new MediaRecorder(micStream);
+        mr.ondataavailable = e => { if (e.data && e.data.size) cap.blobs.push(e.data); };
+        mr.start(); cap.rec = mr;
+      } catch (e) { cap.rec = null; }
+    }
+  }, 150);
   cap.timer = setTimeout(() => { if (S.capturing) { G.held = false; stopPadRecord(); } }, 20000);
   render();
 }
-function stopPadRecord() {
+function stopRecorder() {
+  return new Promise(res => {
+    const mr = cap.rec; if (!mr || mr.state === 'inactive') return res();
+    mr.onstop = () => res(); setTimeout(res, 1500);
+    try { mr.stop(); } catch (e) { res(); }
+  });
+}
+async function decodeBlobs() {
+  if (!cap.blobs.length) return null;
+  try {
+    const ab = await new Blob(cap.blobs, {type: cap.blobs[0].type}).arrayBuffer();
+    const dec = await new Promise((res, rej) => ctx.decodeAudioData(ab, res, rej));
+    const n = dec.length, out = new Float32Array(n);
+    for (let c = 0; c < dec.numberOfChannels; c++) { const d = dec.getChannelData(c); for (let k = 0; k < n; k++) out[k] += d[k] / dec.numberOfChannels; }
+    return {raw: out, sr: dec.sampleRate};
+  } catch (e) { return null; }
+}
+const peakOf = (a, n) => { let p = 0; for (let k = 0; k < n; k++) { const v = Math.abs(a[k]); if (v > p) p = v; } return p; };
+async function stopPadRecord() {
   if (!S.capturing) return;
   clearTimeout(cap.timer);
-  cap.on = false; S.capturing = false;
-  const i = cap.pad, sr = ctx.sampleRate;
+  cap.on = false; S.capturing = false; cap.busy = true;
+  await stopRecorder();
+  const i = cap.pad;
+  let sr = ctx.sampleRate, via = 'direct';
   let len = cap.chunks.reduce((a, c) => a + c.length, 0);
-  const raw = new Float32Array(len); let o = 0;
+  let raw = new Float32Array(len); let o = 0;
   for (const c of cap.chunks) { raw.set(c, o); o += c.length; }
-  len = Math.max(0, len - Math.floor(0.05 * sr));           // drop finger-lift noise
-  let peak = 0; for (let k = 0; k < len; k++) peak = Math.max(peak, Math.abs(raw[k]));
-  if (len < 0.1 * sr || peak < 0.02) {
+  let peak = peakOf(raw, len);
+  if (peak < 0.003) {                                         // graph gave silence: try the MediaRecorder copy
+    const alt = await decodeBlobs();
+    if (alt) { const p2 = peakOf(alt.raw, alt.raw.length); if (p2 > peak) { raw = alt.raw; sr = alt.sr; len = raw.length; peak = p2; via = 'recorder'; } }
+  }
+  cap.busy = false;
+  len = Math.max(0, len - Math.floor(0.05 * sr));             // drop finger-lift noise
+  peak = peakOf(raw, len);
+  if (len < 0.1 * sr) {
     SND.empty(); render();
-    speak(padName(i) + ' unchanged. No sound was heard.');
+    speak(padName(i) + ' unchanged. Too short. After the beep, keep holding while you make your sound.');
     return;
   }
-  let s = 0; while (s < len && Math.abs(raw[s]) < 0.02) s++;
+  if (peak < 0.003) {
+    SND.empty(); render();
+    const tr = micStream && micStream.getAudioTracks()[0];
+    const st = !tr ? 'no microphone track' : tr.readyState !== 'live' ? 'microphone track ended' : tr.muted ? 'microphone muted by the system' : 'microphone on';
+    speak(padName(i) + ' unchanged. No sound was heard. Captured ' + (len / sr).toFixed(1) + ' seconds, loudest level ' +
+      (peak * 100).toFixed(2) + ' percent, ' + st + ', audio ' + ctx.state + '. Reconnecting the microphone, try again.');
+    ensureMic(true);
+    return;
+  }
+  const on = Math.max(0.002, peak * 0.08), off = Math.max(0.001, peak * 0.02);
+  let s = 0; while (s < len && Math.abs(raw[s]) < on) s++;
   s = Math.max(0, s - Math.floor(0.005 * sr));
-  let e = len - 1; while (e > s && Math.abs(raw[e]) < 0.006) e--;
+  let e = len - 1; while (e > s && Math.abs(raw[e]) < off) e--;
   e = Math.min(len, e + Math.floor(0.03 * sr));
-  const n = e - s, gain = Math.min(0.9 / peak, 8);
+  const n = Math.max(1, e - s), gain = Math.min(0.9 / peak, 30);
   const buf = ctx.createBuffer(1, n, sr), d = buf.getChannelData(0);
   const fi = Math.floor(0.003 * sr), fo = Math.floor(0.01 * sr);
   for (let k = 0; k < n; k++) {
@@ -326,7 +381,7 @@ function stopPadRecord() {
   S.padUndo = {i, prev: S.pads[i]};
   S.pads[i] = newPad(buf);
   savePad(i); SND.done(); render();
-  speak(padName(i) + ' recorded, ' + buf.duration.toFixed(1) + ' seconds.');
+  speak(padName(i) + ' recorded, ' + buf.duration.toFixed(1) + ' seconds.' + (via === 'recorder' ? ' Used backup recorder.' : ''));
 }
 
 // ---------------- demo kit ----------------
