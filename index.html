@@ -1107,6 +1107,10 @@ function padMenu(i) {
 }
 function kitMenu(k) {
   return {title: 'Kit ' + (k + 1) + ' menu', idx: 0, items: [
+    {l: () => 'Play surface', a: () => {
+      if (!kitCount(k)) { speak('Kit ' + (k + 1) + ' is empty. Record sounds into it first, or fill it with demo sounds from this menu.'); return 'quiet'; }
+      S.activeKit = k; enterSurface(k, false); return 'quiet'; },
+      h: 'Opens this kit as 8 big pads, two columns of four, to practice or jam without recording. Pads play the instant you touch them. Three-finger tap to leave.'},
     {l: () => 'Open kit editor', a: () => { openKitEditor(k); return 'quiet'; },
       h: 'Shows this kit\'s 8 pads in two rows of four, to play, record, edit, copy or clear each sound.'},
     {l: () => S.activeKit === k ? 'Active kit' : 'Make active kit', a: () => { S.activeKit = k; speak('Kit ' + (k + 1) + ' is now active.'); return 'quiet'; },
