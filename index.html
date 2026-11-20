@@ -1478,8 +1478,16 @@ function onTap(n, x, y) {
   if (S.micLoop) { if (n === 1) requestMicStop(); else if (n === 3) { cancelMicLoop(false); stopTransport(); render(); speak('Mic loop cancelled. Stopped.'); } return; }
   if (n === 1) {
     const now = performance.now();
-    if (now - G.lastTap1 < 350 && Math.hypot(x - G.tap1x, y - G.tap1y) < 70) { G.lastTap1 = 0; openMenu(); }
-    else { G.lastTap1 = now; G.tap1x = x; G.tap1y = y; focusAt(x, y); }
+    if (now - G.lastTap1 < 350) {
+      // Double tap: the first tap moved focus to where it landed. Put focus back on the
+      // item that was focused before, so the double tap acts on it, not on where it happened.
+      G.lastTap1 = 0;
+      if (G.prevFocus) { S.focus = G.prevFocus.focus; S.kitFocus = G.prevFocus.kitFocus; render(); }
+      openMenu();
+    } else {
+      G.lastTap1 = now; G.prevFocus = {focus: S.focus, kitFocus: S.kitFocus};
+      focusAt(x, y);
+    }
   } else if (n === 3) togglePlay();
 }
 const gl = $('gl');
