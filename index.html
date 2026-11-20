@@ -1026,7 +1026,7 @@ function slotDesc(slot) {
   if (z === 0) {
     const c = kitCount(n), act = S.activeKit === n ? 'active' : '';
     const v = [act, c ? (brief ? c + ' sounds' : c + ' of 8 sounds') : 'empty'].filter(Boolean).join(', ');
-    return say('Kit ' + (n + 1), c ? 'button' : 'empty slot', c ? v : act, c ? 'Two-finger tap to make it the active kit. Touch and hold to record into its next empty pad. Double tap for its menu.'
+    return say('Kit ' + (n + 1), c ? 'button' : 'empty slot', c ? v : act, c ? 'Two-finger tap to play it on the play surface. Touch and hold to record into its next empty pad. Double tap for its menu.'
       : 'Touch and hold to record a sound into it. Double tap for its menu.');
   }
   if (z === 1) {
@@ -1244,10 +1244,9 @@ function stageTap(slot) {
   const z = zoneOf(slot), n = slot % 8;
   if (z === 0) {
     if (!kitCount(n)) { render(); speak('Kit ' + (n + 1) + ', empty. Touch and hold to record a sound into it. Double tap for its menu.'); return; }
-    S.activeKit = n; saveState(); render();
-    const first = S.pads.slice(n * 8, n * 8 + 8).findIndex(Boolean);
-    if (first >= 0) playPad(n * 8 + first);
-    speak('Kit ' + (n + 1) + ' active, ' + kitCount(n) + ' of 8 sounds.');
+    S.activeKit = n; saveState();
+    enterSurface(n, true);                                 // two-finger tap opens the kit to play
+    speak('Kit ' + (n + 1) + ', play surface. Two columns of four pads. Three-finger tap to leave.');
   } else if (z === 1) {
     if (!S.patterns[n].events.length) { render(); speak('Pattern ' + (n + 1) + ', empty. Touch and hold to record it with kit ' + (S.activeKit + 1) + '.'); return; }
     togglePattern(n);
@@ -1399,7 +1398,7 @@ function help() {
   let t;
   if (S.menu || S.tab === 'settings') t = (S.menu ? 'Menu' : 'Settings') + '. Swipe up or down to move. Swipe left or right to change a value. Two-finger tap to choose. Touch and hold to hear a description.' + (S.menu ? ' Two-finger swipe down closes the menu.' : '');
   else if (S.kitEd != null) t = 'Kit editor. Two rows of four pads. Tap a pad, drag, or swipe to move to it. Two-finger tap plays the focused pad. Touch and hold to record into the focused pad: wait for the beep, make your sound, then lift. Double tap opens the pad menu, with edit, load from Files, copy, paste and clear. Two-finger swipe left for the next kit, right for the previous kit. Two-finger swipe down goes back to the stage.';
-  else t = 'Stage. Six rows of four. Top two rows: 8 kits. Middle two rows: 8 patterns. Bottom two rows: 8 loops. Tap a slot, drag across slots, or swipe, to move focus and hear what is there. Two-finger tap uses the focused slot: a kit becomes active, a pattern or loop turns on or off at the next bar. Touch and hold to record into the focused slot: a kit\'s next empty pad, a pattern using the active kit, or a mic loop. Double tap opens the focused slot\'s menu.';
+  else t = 'Stage. Six rows of four. Top two rows: 8 kits. Middle two rows: 8 patterns. Bottom two rows: 8 loops. Tap a slot, drag across slots, or swipe, to move focus and hear what is there. Two-finger tap uses the focused slot: a kit opens on the play surface and becomes the active kit, a pattern or loop turns on or off at the next bar. Touch and hold to record into the focused slot: a kit\'s next empty pad, a pattern using the active kit, or a mic loop. Double tap opens the focused slot\'s menu.';
   t += ' While recording a mic loop: tap anywhere with one or two fingers to stop at the next bar line, two-finger swipe down cancels.';
   t += ' Everywhere: three-finger tap plays or stops. Quick settings: three-finger swipe up or down picks speech rate, pitch, voice, speech volume, sound volume, verbosity, tempo or metronome, and three-finger swipe left or right changes it. Two-finger swipe up says where you are. Two-finger double tap skips the current message. Four-finger double tap opens Settings, and again returns to the Stage. Four-finger tap is help.';
   speak(t);
