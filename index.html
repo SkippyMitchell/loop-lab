@@ -88,7 +88,7 @@ const S = {
   tracks: Array(8).fill(null),          // 8 loop slots: {buf, bars, vol, muted, src, g}
   playing: false, recording: false, capturing: false,
   rate: 1.1, confirm: null, confirmT: 0, taps: [], editStep: 1, audioMode: 'playback',
-  voiceEngine: 'espeak', vPitch: 50, duck: true, esVoice: '', loopOffset: null, micLoop: null, wrap: false
+  voiceEngine: 'espeak', vPitch: 50, duck: true, esVoice: '', loopOffset: null, micLoop: null, wrap: false, verb: 1, speechVol: 1, uiVol: 1, qs: 0
 };
 let started = false;
 
@@ -98,8 +98,8 @@ const scheduled = [];
 function initAudio() {
   ctx = new (window.AudioContext || window.webkitAudioContext)({latencyHint: 'interactive'});
   master = ctx.createGain(); master.connect(ctx.destination);
-  uiBus = ctx.createGain(); uiBus.gain.value = 0.9; uiBus.connect(ctx.destination);
-  speechBus = ctx.createGain(); speechBus.gain.value = 1; speechBus.connect(ctx.destination);
+  uiBus = ctx.createGain(); uiBus.gain.value = 0.9 * (S.uiVol ?? 1); uiBus.connect(ctx.destination);
+  speechBus = ctx.createGain(); speechBus.gain.value = S.speechVol ?? 1; speechBus.connect(ctx.destination);
 }
 // Keep iOS in one steady audio mode ("playback") so speech and sounds share it
 // instead of fighting. Recording switches to "play-and-record" only while you hold.
@@ -247,8 +247,7 @@ function sysSpeak(text, interrupt) {
 // ---- eSpeak voice, played through Loop Lab's own sound engine ----
 // Speech and sounds share one engine, so iOS can't fade one under the other.
 const ES = {worker: null, ready: false, failed: false, id: 0, pending: new Map(), cache: new Map(),
-  jobs: [], workerBusy: false, queue: [], busy: false, cur: null, curRes: null};
-let speechGen = 0;
+  jobs: [], workerBusy: false, queue: [], busy: false, cur: null, curRes: null, curItem: null};
 function initEspeak() {
   try { ES.worker = new Worker('espeak-worker.js'); } catch (e) { ES.failed = true; return; }
   ES.worker.onmessage = e => {
@@ -278,23 +277,31 @@ function wavToBuffer(wav) {
   const b = ctx.createBuffer(1, e - s, sr); b.copyToChannel(f.subarray(s, e), 0);
   return b;
 }
-function genSpeech(text) {
+// KAM speech rules: messages queue and are never dropped; any gesture cuts in with
+// its own speech; a two-finger double tap skips just the current message.
+let gestureDepth = 0;                         // > 0 while handling a gesture
+function asGesture(fn) { return function (...a) { gestureDepth++; try { return fn.apply(this, a); } finally { gestureDepth--; } }; }
+function genSpeech(text, item) {
   const key = text + '|' + S.rate + '|' + S.vPitch + '|' + S.esVoice, c = ES.cache.get(key);
   if (c) { ES.cache.delete(key); ES.cache.set(key, c); return Promise.resolve(c); }
-  return new Promise(res => { ES.jobs.push({text, key, res, gen: speechGen}); runJobs(); });
+  return new Promise(res => { ES.jobs.push({text, key, res, item}); runJobs(); });
 }
 function runJobs() {
   if (ES.workerBusy) return;
-  while (ES.jobs.length && ES.jobs[0].gen !== speechGen) ES.jobs.shift().res(null);   // drop stale requests
+  while (ES.jobs.length && ES.jobs[0].item && ES.jobs[0].item.dead) ES.jobs.shift().res(null);   // skip speech nobody wants
   const j = ES.jobs.shift(); if (!j) return;
   ES.workerBusy = true;
   const id = ++ES.id;
-  ES.pending.set(id, wav => {
-    ES.workerBusy = false;
+  let settled = false;
+  const done = wav => {
+    if (settled) return; settled = true;
+    ES.pending.delete(id); ES.workerBusy = false;
     let b = null; try { if (wav) b = wavToBuffer(wav); } catch (e) {}
     if (b) { ES.cache.set(j.key, b); if (ES.cache.size > 300) ES.cache.delete(ES.cache.keys().next().value); }
     j.res(b); runJobs();
-  });
+  };
+  ES.pending.set(id, done);
+  setTimeout(() => done(null), 4000);         // never wait forever on the speech engine
   ES.worker.postMessage({id, text: j.text, args: esArgs()});
 }
 function duck(on) {
@@ -302,38 +309,58 @@ function duck(on) {
   const g = on && S.duck ? 0.4 : 1;
   try { master.gain.setTargetAtTime(g, ctx.currentTime, 0.04); } catch (e) {}
 }
+function makeItem(text, kind) { const it = {text, kind, dead: false}; it.p = genSpeech(text, it); return it; }
 async function pumpSpeech() {
   if (ES.busy) return; ES.busy = true;
-  while (ES.queue.length) {
-    const item = ES.queue.shift();
-    const b = await item.p;
-    if (item.gen !== speechGen || !b) continue;
-    await new Promise(res => {
-      if (item.gen !== speechGen) return res();
-      const src = ctx.createBufferSource(); src.buffer = b; src.connect(speechBus);
-      let done = false;
-      const fin = () => { if (done) return; done = true; if (ES.cur === src) { ES.cur = null; ES.curRes = null; } res(); };
-      src.onended = fin;
-      setTimeout(fin, b.duration * 1000 + 700);   // never get stuck if iOS pauses the engine
-      ES.cur = src; ES.curRes = fin; duck(true); unlock(); src.start();
-    });
-  }
-  ES.busy = false; duck(false);
+  try {
+    while (ES.queue.length) {
+      const item = ES.queue[0];
+      const b = await item.p;
+      if (ES.queue[0] !== item) continue;                // the queue changed while this was being made
+      ES.queue.shift();
+      if (item.dead || !b) continue;
+      if (S.capturing || S.micLoop) continue;            // never talk into the microphone
+      await new Promise(res => {
+        const src = ctx.createBufferSource(); src.buffer = b; src.connect(speechBus);
+        let done = false;
+        const fin = () => { if (done) return; done = true; if (ES.cur === src) { ES.cur = null; ES.curRes = null; ES.curItem = null; } res(); };
+        src.onended = fin;
+        setTimeout(fin, b.duration * 1000 + 700);       // never get stuck if iOS pauses the engine
+        ES.cur = src; ES.curRes = fin; ES.curItem = item; duck(true); unlock(); src.start();
+      });
+    }
+  } finally { ES.busy = false; duck(false); }
 }
-function hushSpeech() {
-  speechGen++; ES.queue.length = 0;
-  if (ES.cur) { try { ES.cur.onended = null; ES.cur.stop(); } catch (e) {} ES.cur = null; }
-  if (ES.curRes) { const r = ES.curRes; ES.curRes = null; r(); }
-  duck(false);
+function stopCurrent() {
+  if (ES.cur) { try { ES.cur.onended = null; ES.cur.stop(); } catch (e) {} }
+  if (ES.curRes) { const r = ES.curRes; r(); }
+  ES.cur = null; ES.curRes = null; ES.curItem = null;
 }
-function speak(text, interrupt = true) {
+// A gesture cuts in: drop older gesture speech, keep every message, and replay an
+// interrupted message after the gesture's own speech.
+function cutIn() {
+  const cur = ES.curItem;
+  ES.queue.forEach(i => { if (i.kind === 'g') i.dead = true; });
+  ES.queue = ES.queue.filter(i => i.kind === 'n');
+  stopCurrent();
+  if (cur && cur.kind === 'n') ES.queue.unshift(makeItem(cur.text, 'n'));
+}
+function hushSpeech() {                       // full stop, used before recording
+  ES.queue.forEach(i => i.dead = true); ES.queue = [];
+  stopCurrent(); duck(false);
+}
+function skipMessage() { if (ES.cur) stopCurrent(); else if (synth) synth.cancel(); }
+const msgLog = [];
+function speak(text, interrupt) {
   $('status').textContent = text;
+  msgLog.push(text); if (msgLog.length > 50) msgLog.shift();
   if (S.capturing || S.micLoop) return;          // never talk into the microphone
-  if (!useEspeak()) { sysSpeak(text, interrupt); return; }
-  if (interrupt) { hushSpeech(); if (synth) synth.cancel(); }
-  const gen = speechGen;
+  const kind = interrupt === false || gestureDepth === 0 ? 'n' : 'g';
+  if (!useEspeak()) { sysSpeak(text, kind === 'g'); return; }
+  if (kind === 'g') { cutIn(); if (synth) synth.cancel(); }
   const parts = (text.match(/[^.!?]+[.!?]*/g) || [text]).map(x => x.trim()).filter(Boolean);
-  for (const p of parts) ES.queue.push({p: genSpeech(p), gen});   // first sentence starts while the rest generate
+  const items = parts.map(p => makeItem(p, kind));   // the first sentence starts while the rest are made
+  if (kind === 'g') ES.queue.unshift(...items); else ES.queue.push(...items);
   pumpSpeech();
 }
 function hush() { hushSpeech(); if (synth) synth.cancel(); }
@@ -390,7 +417,7 @@ let saveTimer = null;
 function saveState() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    const k = ['activeKit','bpm','bpb','bars','metro','metroVol','countIn','quant','takeId','rate','editStep','audioMode','voiceEngine','vPitch','duck','esVoice','loopOffset','wrap'];
+    const k = ['activeKit','bpm','bpb','bars','metro','metroVol','countIn','quant','takeId','rate','editStep','audioMode','voiceEngine','vPitch','duck','esVoice','loopOffset','wrap','verb','speechVol','uiVol','qs'];
     const o = {}; k.forEach(x => o[x] = S[x]);
     o.patterns = S.patterns.map(p => ({events: p.events.map(e => ({pad: e.pad, beat: e.beat, take: e.take})), takes: p.takes, kit: p.kit, bars: p.bars, on: p.on}));
     DB.put('state', o);
@@ -949,7 +976,8 @@ function surfStart(e) {
     }
   }
 }
-function surfEnd(e) {
+const surfEnd = asGesture(surfEnd_);
+function surfEnd_(e) {
   for (const t of e.changedTouches) SG.active.delete(t.identifier);
   if (e.touches && !e.touches.length) SG.active.clear();
   if (!SG.active.size && SG.cmd) { SG.cmd = false; exitSurface(); }
@@ -960,7 +988,25 @@ function flash(k) {
 }
 
 // ---------------- descriptions ----------------
-function itemText(it) { if (!it) return ''; const v = it.v ? it.v() : ''; return it.l() + (v ? ', ' + v : ''); }
+// KAM wording: name, then role, then value. Verbosity: 0 brief, 1 normal, 2 full (adds the hint).
+const VERBS = ['brief', 'normal', 'full'];
+function roleOf(it) {
+  if (it.r) return it.r;
+  const v = it.v ? it.v() : '';
+  if (v === 'on' || v === 'off') return 'toggle';
+  if (it.adj) return 'adjustable';
+  return 'button';
+}
+function say(name, role, value, hint) {
+  const parts = [name];
+  if (S.verb >= 1 && role) parts.push(role);
+  else if (role === 'empty slot' && !value) parts.push('empty');
+  if (value) parts.push(value);
+  let t = parts.join(', ');
+  if (S.verb >= 2 && hint) t += '. ' + hint;
+  return t;
+}
+function itemText(it) { if (!it) return ''; return say(it.l(), roleOf(it), it.v ? it.v() : '', it.h); }
 function confirmThen(key, fn) {
   return () => {
     if (S.confirm === key && performance.now() < S.confirmT) { S.confirm = null; fn(); }
@@ -970,26 +1016,31 @@ function confirmThen(key, fn) {
 }
 function padDesc(i) {
   const p = S.pads[i], n = 'Pad ' + ((i % 8) + 1);
-  if (!p) return n + ', empty';
-  return n + ', ' + (p.name || 'recorded') + ', ' + padLen(p).toFixed(2) + ' seconds' + (isEdited(p) ? ', edited' : '') + (p.vol !== 1 ? ', volume ' + pct(p.vol) : '');
+  if (!p) return say(n, 'empty slot', '', 'Touch and hold to record into it.');
+  const v = (p.name || 'recorded') + (S.verb ? ', ' + padLen(p).toFixed(2) + ' seconds' + (isEdited(p) ? ', edited' : '') + (p.vol !== 1 ? ', volume ' + pct(p.vol) : '') : '');
+  return say(n, 'button', v, 'Two-finger tap to play. Double tap for the pad menu.');
 }
 const zoneOf = slot => Math.floor(slot / 8);
 function slotDesc(slot) {
-  const z = zoneOf(slot), n = slot % 8;
+  const z = zoneOf(slot), n = slot % 8, brief = S.verb === 0;
   if (z === 0) {
-    const c = kitCount(n);
-    return 'Kit ' + (n + 1) + ', ' + (c ? c + ' of 8 sounds' : 'empty') + (S.activeKit === n ? ', active' : '');
+    const c = kitCount(n), act = S.activeKit === n ? 'active' : '';
+    const v = [act, c ? (brief ? c + ' sounds' : c + ' of 8 sounds') : 'empty'].filter(Boolean).join(', ');
+    return say('Kit ' + (n + 1), c ? 'button' : 'empty slot', c ? v : act, c ? 'Two-finger tap to make it the active kit. Touch and hold to record into its next empty pad. Double tap for its menu.'
+      : 'Touch and hold to record a sound into it. Double tap for its menu.');
   }
   if (z === 1) {
     const p = S.patterns[n];
-    if (!p.events.length) return 'Pattern ' + (n + 1) + ', empty';
-    return 'Pattern ' + (n + 1) + ', ' + (pending(p) ? (p.on ? 'turning on' : 'turning off') : p.on ? 'on' : 'off') + ', ' +
-      plural(p.events.length, 'hit') + ', kit ' + (p.kit + 1) + ', ' + plural(p.bars, 'bar');
+    if (!p.events.length) return say('Pattern ' + (n + 1), 'empty slot', '', 'Touch and hold to record it with kit ' + (S.activeKit + 1) + '.');
+    const st = pending(p) ? (p.on ? 'turning on' : 'turning off') : p.on ? 'on' : 'off';
+    return say('Pattern ' + (n + 1), 'toggle', brief ? st : st + ', ' + plural(p.events.length, 'hit') + ', kit ' + (p.kit + 1) + ', ' + plural(p.bars, 'bar'),
+      'Two-finger tap to turn it ' + (p.on ? 'off' : 'on') + ' at the next bar. Touch and hold to record more. Double tap for its menu.');
   }
   const tr = S.tracks[n];
-  if (!tr) return 'Loop ' + (n + 1) + ', empty';
-  return 'Loop ' + (n + 1) + ', ' + (pending(tr) ? (tr.muted ? 'turning off' : 'turning on') : tr.muted ? 'off' : 'on') + ', ' +
-    plural(tr.bars, 'bar') + (tr.vol !== 1 ? ', volume ' + pct(tr.vol) : '');
+  if (!tr) return say('Loop ' + (n + 1), 'empty slot', '', 'Touch and hold to record a mic loop.');
+  const st = pending(tr) ? (tr.muted ? 'turning off' : 'turning on') : tr.muted ? 'off' : 'on';
+  return say('Loop ' + (n + 1), 'toggle', brief ? st : st + ', ' + plural(tr.bars, 'bar') + (tr.vol !== 1 ? ', volume ' + pct(tr.vol) : ''),
+    'Two-finger tap to turn it ' + (tr.muted ? 'on' : 'off') + ' at the next bar. Touch and hold to layer or replace. Double tap for its menu.');
 }
 function focusDesc() {
   if (S.menu) return S.menu.title + '. ' + itemText(S.menu.items[S.menu.idx]);
@@ -1139,7 +1190,12 @@ function settingsItems() {
       h: 'Choose from 18 eSpeak voices. Swipe left or right to hear each one.'},
     {l: () => 'Voice pitch', v: () => String(S.vPitch), adj: d => { S.vPitch = clamp(S.vPitch + d * 5, 0, 99); }, h: 'eSpeak pitch, from 0 to 99.'},
     {l: () => 'Speech rate', v: () => Math.round(S.rate * 100) + ' percent', adj: d => { S.rate = clamp(round1(S.rate + d * 0.1), 0.5, 2); },
-      h: 'Three-finger swipe up or down also changes this from anywhere.'},
+      h: 'Also in quick settings: three-finger swipe up or down to pick, left or right to change.'},
+    {l: () => 'Speech volume', v: () => pct(S.speechVol), adj: d => { S.speechVol = clamp(round1(S.speechVol + d * 0.1), 0.1, 2); if (speechBus) speechBus.gain.value = S.speechVol; }},
+    {l: () => 'Sound volume', v: () => pct(S.uiVol), adj: d => { S.uiVol = clamp(round1(S.uiVol + d * 0.1), 0, 2); if (uiBus) uiBus.gain.value = 0.9 * S.uiVol; SND.tick(); },
+      h: 'Volume of the ticks, tones and other interface sounds. Music volume is not changed.'},
+    {l: () => 'Verbosity', v: () => VERBS[S.verb], adj: d => { S.verb = clamp(S.verb + d, 0, 2); },
+      h: 'Brief says just names and states. Normal adds roles and details. Full also adds a hint about what you can do.'},
     {l: () => 'Lower sounds while speaking', v: () => S.duck ? 'on' : 'off', a: () => { S.duck = !S.duck; }, adj: () => { S.duck = !S.duck; },
       h: 'Turns the music down while eSpeak talks, so you can hear it.'},
     {l: () => 'Audio mode', v: () => AUDIO_MODES[S.audioMode],
@@ -1321,6 +1377,19 @@ function toggleVoice() {
   setSession(S.voiceEngine === 'espeak' ? 'playback' : 'ambient');
   S.audioMode = S.voiceEngine === 'espeak' ? 'playback' : 'ambient';
 }
+// KAM quick settings: three-finger swipe up or down picks an item, left or right changes it.
+const QS_ITEMS = ['Speech rate', 'Voice pitch', 'eSpeak voice', 'Speech volume', 'Sound volume', 'Verbosity', 'Tempo', 'Metronome'];
+function qsItem() { const l = QS_ITEMS[clamp(S.qs || 0, 0, QS_ITEMS.length - 1)]; return settingsItems().find(i => i.l() === l); }
+function quickSettings(dir) {
+  if (dir === 'up' || dir === 'down') {
+    const n = stepIndex(S.qs || 0, dir === 'down' ? 1 : -1, QS_ITEMS.length); if (n < 0) return;
+    S.qs = n; SND.tick(); saveState();
+    const it = qsItem(); speak(it.l() + ', ' + it.v());
+  } else {
+    const it = qsItem(); it.adj(dir === 'right' ? 1 : -1); SND.tick(); saveState(); render();
+    speak(it.v());
+  }
+}
 function rateChange(d) { S.rate = clamp(round1(S.rate + d * 0.1), 0.5, 2); saveState(); speak('Speech rate ' + Math.round(S.rate * 100) + ' percent'); }
 function help() {
   let t;
@@ -1328,7 +1397,7 @@ function help() {
   else if (S.kitEd != null) t = 'Kit editor. Two rows of four pads. Tap a pad, drag, or swipe to move to it. Two-finger tap plays the focused pad. Touch and hold to record into the focused pad: wait for the beep, make your sound, then lift. Double tap opens the pad menu, with edit, load from Files, copy, paste and clear. Two-finger swipe left for the next kit, right for the previous kit. Two-finger swipe down goes back to the stage.';
   else t = 'Stage. Six rows of four. Top two rows: 8 kits. Middle two rows: 8 patterns. Bottom two rows: 8 loops. Tap a slot, drag across slots, or swipe, to move focus and hear what is there. Two-finger tap uses the focused slot: a kit becomes active, a pattern or loop turns on or off at the next bar. Touch and hold to record into the focused slot: a kit\'s next empty pad, a pattern using the active kit, or a mic loop. Double tap opens the focused slot\'s menu.';
   t += ' While recording a mic loop: tap anywhere with one or two fingers to stop at the next bar line, two-finger swipe down cancels.';
-  t += ' Everywhere: three-finger tap plays or stops. Three-finger swipe left moves on to Settings, and three-finger swipe right moves back to the Stage, like sliding pages. Three-finger swipe up or down changes speech rate. Two-finger swipe up says where you are. Two-finger double tap stops speech. Four-finger double tap opens Settings, and again returns. Four-finger tap is help.';
+  t += ' Everywhere: three-finger tap plays or stops. Quick settings: three-finger swipe up or down picks speech rate, pitch, voice, speech volume, sound volume, verbosity, tempo or metronome, and three-finger swipe left or right changes it. Two-finger swipe up says where you are. Two-finger double tap skips the current message. Four-finger double tap opens Settings, and again returns to the Stage. Four-finger tap is help.';
   speak(t);
 }
 
@@ -1337,7 +1406,8 @@ const G = {pts: new Map(), all: [], max: 0, t0: 0, hold: null, held: false, last
   exploring: false, moved: 0, last: -1};
 const posMode = () => !inList() && !S.micLoop;          // stage or kit editor: touch position matters
 function slotUnder(x, y) { return S.kitEd != null ? kitPadAt(x, y) : slotAt(x, y); }
-function holdFire() {
+const holdFire = asGesture(holdFire_);
+function holdFire_() {
   G.held = true;
   if (S.micLoop) return;
   if (inList()) { const L = curList(); const it = L && L.items[L.get()]; if (it) speak(it.h || itemText(it)); return; }
@@ -1345,13 +1415,15 @@ function holdFire() {
   else stageHold(S.focus);
 }
 function holdEnd() { if (S.capturing) stopPadRecord(); }
-function explore(x, y) {
+const explore = asGesture(explore_);
+function explore_(x, y) {
   const s = slotUnder(x, y); if (s === G.last) return;
   G.last = s;
   if (S.kitEd != null) { S.kitFocus = s; SND.tick(); render(); speak(padDesc(S.kitEd * 8 + s)); }
   else { S.focus = s; zoneTone(s); render(); speak(slotDesc(s)); }
 }
-function classify() {
+const classify = asGesture(classify_);
+function classify_() {
   const dur = performance.now() - G.t0, n = G.max;
   if (G.exploring) return;                               // explore leaves focus where you lifted
   let dx = 0, dy = 0, cx = 0, cy = 0;
@@ -1364,12 +1436,12 @@ function classify() {
   } else if (d < 30 && dur < 400) {
     if (n === 2) {                                       // two-finger tap: use the focused item
       const now = performance.now();
-      if (now - G.lastTap2 < 350) { clearTimeout(G.tap2Timer); G.lastTap2 = 0; hush(); }
-      else { G.lastTap2 = now; G.tap2Timer = setTimeout(() => { if (S.micLoop) requestMicStop(); else activate(); }, 300); }
+      if (now - G.lastTap2 < 350) { clearTimeout(G.tap2Timer); G.lastTap2 = 0; skipMessage(); }
+      else { G.lastTap2 = now; G.tap2Timer = setTimeout(asGesture(() => { if (S.micLoop) requestMicStop(); else activate(); }), 300); }
     } else if (n >= 4 && !S.micLoop) {
       const now = performance.now();
       if (now - G.lastTap4 < 400) { clearTimeout(G.tap4Timer); G.lastTap4 = 0; toggleSettings(); }
-      else { G.lastTap4 = now; G.tap4Timer = setTimeout(() => help(), 350); }
+      else { G.lastTap4 = now; G.tap4Timer = setTimeout(asGesture(() => help()), 350); }
     } else onTap(n, G.all[0].x0, G.all[0].y0);
   }
 }
@@ -1400,10 +1472,7 @@ function onSwipe(n, dir) {
     else if (dir === 'up') whereAmI();
     else if (S.kitEd != null && !S.menu) changeKit(dir === 'left' ? 1 : -1);   // swipe left = next kit slides in
     else SND.edge();
-  } else if (n === 3) {
-    if (dir === 'left' || dir === 'right') switchTab(dir === 'left' ? 1 : -1);  // swipe left = next page slides in
-    else rateChange(dir === 'up' ? 1 : -1);
-  }
+  } else if (n === 3) quickSettings(dir);
 }
 function onTap(n, x, y) {
   if (S.micLoop) { if (n === 1) requestMicStop(); else if (n === 3) { cancelMicLoop(false); stopTransport(); render(); speak('Mic loop cancelled. Stopped.'); } return; }
@@ -1473,7 +1542,7 @@ gl.addEventListener('touchcancel', tEnd, {passive: false});
 // hold Space to record, M menu, Escape back, P play, O settings, H help, W where am I.
 const SURF_KEYS = '12qwaszx';
 let spaceDown = false;
-document.addEventListener('keydown', e => {
+document.addEventListener('keydown', asGesture(e => {
   if (!started || e.repeat && e.key !== ' ') return;
   unlock();
   if (S.surface) {
@@ -1485,7 +1554,7 @@ document.addEventListener('keydown', e => {
     e.preventDefault(); return;
   }
   const arrows = {ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right'};
-  if (arrows[e.key]) { e.shiftKey ? onSwipe(3, arrows[e.key]) : onSwipe(1, arrows[e.key]); }
+  if (arrows[e.key]) { e.shiftKey ? onSwipe(3, arrows[e.key]) : onSwipe(1, arrows[e.key]); }   // Shift+arrows: quick settings
   else if (e.key === 'Enter') activate();
   else if (e.key === ' ') {
     if (!spaceDown) { spaceDown = true; G.held = true;
@@ -1501,7 +1570,7 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'w') whereAmI();
   else return;
   e.preventDefault();
-});
+}));
 document.addEventListener('keyup', e => { if (e.key === ' ' && spaceDown) { spaceDown = false; G.held = false; holdEnd(); } });
 
 // ---------------- rendering (visual, for sighted collaborators) ----------------
@@ -1563,7 +1632,7 @@ $('startBtn').addEventListener('click', async () => {
   setSession(S.audioMode);
   await waitForVoice(4000);
   $('start').remove(); started = true; render();
-  speak('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
+  asGesture(speak)('Loop Lab ready. If VoiceOver is on, turn it off now. ' + (n ? n + ' pads loaded. ' : '') +
     (micOK ? '' : 'Microphone is not available, so use Load from Files or demo sounds in a kit menu. ') +
     'Stage. Kits on top, patterns in the middle, loops at the bottom. ' + slotDesc(S.focus) + '. Four-finger tap for help.');
 });
