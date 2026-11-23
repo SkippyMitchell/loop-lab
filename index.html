@@ -49,6 +49,7 @@
   <h1>Loop Lab</h1>
   <p>If VoiceOver is on, double tap Start, allow microphone access, then turn VoiceOver off with your accessibility shortcut. Loop Lab speaks for itself.</p>
   <button id="startBtn">Start</button>
+  <p id="ver"></p>
 </div>
 <div id="app" aria-hidden="true">
   <header>
@@ -63,6 +64,20 @@
 
 <script>
 'use strict';
+// Bump this with every update. On launch Loop Lab fetches a fresh copy of itself, skipping
+// Safari's cache, and reloads if the version differs, so you always get the newest one.
+const APP_VERSION = '2026-11-23b';
+document.getElementById('ver').textContent = 'Version ' + APP_VERSION;
+(async () => {
+  try {
+    const r = await fetch(location.pathname + '?check=' + Date.now(), {cache: 'no-store'});
+    const m = (await r.text()).match(/APP_VERSION = '([^']+)'/);
+    if (m && m[1] !== APP_VERSION && !sessionStorage.getItem('ll-reloaded-' + m[1])) {
+      sessionStorage.setItem('ll-reloaded-' + m[1], '1');
+      location.replace(location.pathname + '?v=' + encodeURIComponent(m[1]));
+    }
+  } catch (e) {}
+})();
 const $ = id => document.getElementById(id);
 const ZONES = ['Kits', 'Patterns', 'Loops'];
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
