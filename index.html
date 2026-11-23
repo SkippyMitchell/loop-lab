@@ -309,7 +309,12 @@ function duck(on) {
   const g = on && S.duck ? 0.4 : 1;
   try { master.gain.setTargetAtTime(g, ctx.currentTime, 0.04); } catch (e) {}
 }
-function makeItem(text, kind) { const it = {text, kind, dead: false}; it.p = genSpeech(text, it); return it; }
+// Words eSpeak's old dictionary says wrong, and a spelling it says right.
+// Only the voice hears these; the screen keeps the real word.
+const ES_FIXES = {copy: 'coppy'};
+const ES_FIX_RE = new RegExp('\\b(' + Object.keys(ES_FIXES).join('|') + ')\\b', 'gi');
+const esFix = t => t.replace(ES_FIX_RE, w => ES_FIXES[w.toLowerCase()]);
+function makeItem(text, kind) { const it = {text, kind, dead: false}; it.p = genSpeech(esFix(text), it); return it; }
 async function pumpSpeech() {
   if (ES.busy) return; ES.busy = true;
   try {
